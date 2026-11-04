@@ -1,0 +1,25 @@
+{
+  "name": "wohn-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc && node scripts/copy-schema.mjs",
+    "start": "node dist/infrastructure/main.js",
+    "dev": "tsx src/infrastructure/main.ts",
+    "test": "node --import tsx --test test/**/*.test.ts",
+    "chrome": "powershell -ExecutionPolicy Bypass -File scripts/start-chrome.ps1"
+  },
+  "dependencies": {
+    "@browserbasehq/stagehand": "4.3.0",
+    "zod": "4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.0",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3"
+  }
+}

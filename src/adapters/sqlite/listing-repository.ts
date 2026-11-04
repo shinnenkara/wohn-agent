@@ -1,0 +1,148 @@
+import type { DatabaseSync } from "node:sqlite";
+import type { ListingRepository } from "../../application/ports/listing-repository.js";
+import { Listing, type ListingData } from "../../domain/listing.js";
+import { isListingStatus, type ListingStatus } from "../../domain/listing-status.js";
+import { DomainError } from "../../domain/domain-error.js";
+
+interface ListingRow {
+  scout_id: string;
+  url: string;
+  title: string | null;
+  salutation: string | null;
+  price_cold: number | null;
+  rooms: number | null;
+  area_sqm: number | null;
+  is_plus_only: number | null;
+  status: string;
+  filter_reason: string | null;
+  error_code: string | null;
+  retry_count: number | null;
+  discovered_at: string;
+  applied_at: string | null;
+}
+
+export class SqliteListingRepository implements ListingRepository {
+  constructor(private readonly db: DatabaseSync) {}
+
+  findById(scoutId: string): Listing | null {
+    const row = this.db
+      .prepare("SELECT * FROM listings WHERE scout_id = ?")
+      .get(scoutId) as ListingRow | undefined;
+    return row ? toListing(row) : null;
+  }
+
+  findExistingIds(ids: readonly string[]): Set<string> {
+    if (ids.length === 0) {
+      return new Set();
+    }
+    const placeholders = ids.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(`SELECT scout_id FROM listings WHERE scout_id IN (${placeholders})`)
+      .all(...ids) as Array<{ scout_id: string }>;
+    return new Set(rows.map((row) => row.scout_id));
+  }
+
+  insertAll(listings: readonly Listing[]): void {
+    if (listings.length === 0) {
+      return;
+    }
+    const insert = this.db.prepare(`
+      INSERT OR IGNORE INTO listings (
+        scout_id, url, title, salutation, price_cold, rooms, area_sqm, is_plus_only,
+        status, filter_reason, error_code, retry_count, discovered_at, applied_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    this.db.exec("BEGIN");
+    try {
+      for (const listing of listings) {
+        insert.run(...bindListing(listing.toData()));
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  save(listing: Listing): void {
+    this.db
+      .prepare(`
+        INSERT INTO listings (
+          scout_id, url, title, salutation, price_cold, rooms, area_sqm, is_plus_only,
+          status, filter_reason, error_code, retry_count, discovered_at, applied_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(scout_id) DO UPDATE SET
+          url = excluded.url,
+          title = excluded.title,
+          salutation = excluded.salutation,
+          price_cold = excluded.price_cold,
+          rooms = excluded.rooms,
+          area_sqm = excluded.area_sqm,
+          is_plus_only = excluded.is_plus_only,
+          status = excluded.status,
+          filter_reason = excluded.filter_reason,
+          error_code = excluded.error_code,
+          retry_count = excluded.retry_count,
+          discovered_at = excluded.discovered_at,
+          applied_at = excluded.applied_at
+      `)
+      .run(...bindListing(listing.toData()));
+  }
+
+  listByStatus(status: ListingStatus): Listing[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM listings WHERE status = ? ORDER BY discovered_at DESC, rowid DESC",
+      )
+      .all(status) as unknown as ListingRow[];
+    return rows.map(toListing);
+  }
+
+  resetApplyingToDiscovered(): number {
+    const result = this.db
+      .prepare("UPDATE listings SET status = 'DISCOVERED' WHERE status = 'APPLYING'")
+      .run();
+    return Number(result.changes);
+  }
+}
+
+function bindListing(data: ListingData): Array<string | number | null> {
+  return [
+    data.scoutId,
+    data.url,
+    data.title,
+    data.salutation,
+    data.priceCold,
+    data.rooms,
+    data.areaSqm,
+    data.isPlusOnly ? 1 : 0,
+    data.status,
+    data.filterReason,
+    data.errorCode,
+    data.retryCount,
+    data.discoveredAt.toISOString(),
+    data.appliedAt ? data.appliedAt.toISOString() : null,
+  ];
+}
+
+function toListing(row: ListingRow): Listing {
+  if (!isListingStatus(row.status)) {
+    throw new DomainError(`Unknown listing status ${row.status}`);
+  }
+  return Listing.rehydrate({
+    scoutId: row.scout_id,
+    url: row.url,
+    title: row.title,
+    salutation: row.salutation,
+    priceCold: row.price_cold,
+    rooms: row.rooms,
+    areaSqm: row.area_sqm,
+    isPlusOnly: row.is_plus_only === 1,
+    status: row.status,
+    filterReason: row.filter_reason,
+    errorCode: row.error_code,
+    retryCount: row.retry_count ?? 0,
+    discoveredAt: new Date(row.discovered_at),
+    appliedAt: row.applied_at ? new Date(row.applied_at) : null,
+  });
+}

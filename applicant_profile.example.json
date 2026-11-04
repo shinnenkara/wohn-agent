@@ -1,0 +1,26 @@
+{
+  "search_urls": [
+    "https://www.immobilienscout24.de/Suche/de/berlin/berlin/wohnung-mieten"
+  ],
+  "blacklist_keywords": [
+    "tauschwohnung",
+    "wohnungstausch",
+    "nur tausch",
+    "wbs erforderlich",
+    "wbs-schein"
+  ],
+  "form_data": {
+    "salutation": "Herr",
+    "first_name": "Max",
+    "last_name": "Mustermann",
+    "phone": "+49 170 0000000",
+    "move_in_date": "ab sofort / flexibel",
+    "number_of_persons": "1",
+    "has_pets": "Nein",
+    "employment_status": "Angestellt (unbefristet)",
+    "monthly_net_income": "4200",
+    "schufa_available": true,
+    "send_application_package": true
+  },
+  "message_template": "Sehr geehrte(r) {{contact_name}},\n\nmit großem Interesse habe ich Ihr Inserat für die Wohnung ({{title}}) gelesen. Ich bin unbefristet angestellt, habe keine Haustiere und kann kurzfristig einziehen. Über eine Einladung zur Besichtigung freue ich mich.\n\nMit freundlichen Grüßen\nMax Mustermann"
+}
