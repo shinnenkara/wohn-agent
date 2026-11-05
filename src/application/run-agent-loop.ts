@@ -24,6 +24,7 @@ import type { FailureClassifier } from "./ports/failure-classifier.js";
 import type { ListingRepository } from "./ports/listing-repository.js";
 import type { Logger } from "./ports/logger.js";
 import type { Notifier } from "./ports/notifier.js";
+import type { ProgressLog } from "./ports/progress-log.js";
 import type { SelectorCache } from "./ports/selector-cache.js";
 
 export interface LoopDependencies {
@@ -41,6 +42,7 @@ export interface LoopDependencies {
   maxApplicationsPerCycle: number;
   dryRun: boolean;
   overnightRun: boolean;
+  progress: ProgressLog;
 }
 
 export type NightPhase = "active" | "sleeping" | "overnight";

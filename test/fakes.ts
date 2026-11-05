@@ -16,7 +16,10 @@ import type { FailureClassifier, FailureContext } from "../src/application/ports
 import type { ListingRepository } from "../src/application/ports/listing-repository.js";
 import type { Logger } from "../src/application/ports/logger.js";
 import type { Alert, Notifier } from "../src/application/ports/notifier.js";
+import type { ProgressLog, ProgressNote, ProgressTransitionRow, StageRow, ApartmentCard } from "../src/application/ports/progress-log.js";
 import type { SelectorCache } from "../src/application/ports/selector-cache.js";
+import { exposeUrl } from "../src/domain/expose-url.js";
+import { advance, type FunnelStage } from "../src/domain/progress.js";
 import type { LoopDependencies } from "../src/application/run-agent-loop.js";
 import type { ApplicantProfile, ProfileField } from "../src/domain/applicant-profile.js";
 import { CaptchaEncountered, type CaptchaSignal } from "../src/domain/captcha-signal.js";
@@ -69,8 +72,15 @@ export function sampleExpose(patch?: Partial<ExposeFacts>): ExposeFacts {
     contactName: "Frau Müller",
     description: "Ruhige Wohnung mit Balkon.",
     priceCold: 1200,
+    priceWarm: null,
+    extraCosts: null,
+    deposit: null,
     rooms: 2,
     areaSqm: 60,
+    floor: null,
+    moveIn: null,
+    address: null,
+    snapshot: "",
     isPlusOnly: false,
     externalPortal: false,
     ...patch,
@@ -151,6 +161,70 @@ export class InMemoryListings implements ListingRepository {
       }
     }
     return count;
+  }
+}
+
+export class InMemoryProgress implements ProgressLog {
+  readonly stages = new Map<string, FunnelStage>();
+  readonly transitions: ProgressTransitionRow[] = [];
+
+  stageOf(scoutId: string): FunnelStage | null {
+    return this.stages.get(scoutId) ?? null;
+  }
+
+  note(input: ProgressNote): boolean {
+    const result = advance(this.stageOf(input.scoutId), input.next);
+    if (!result.moved) {
+      return false;
+    }
+    this.stages.set(input.scoutId, result.stage);
+    if (result.from) {
+      this.transitions.push({
+        scoutId: input.scoutId,
+        fromStage: result.from,
+        toStage: result.stage,
+        source: input.source,
+        evidenceId: input.evidenceId,
+        createdAt: input.at,
+      });
+    }
+    return true;
+  }
+
+  backfillListings(): number {
+    return 0;
+  }
+
+  listStages(): StageRow[] {
+    return [...this.stages.entries()].map(([scoutId, stage]) => ({ scoutId, stage }));
+  }
+
+  listTransitions(): ProgressTransitionRow[] {
+    return [...this.transitions];
+  }
+
+  listApartments(stage: FunnelStage): ApartmentCard[] {
+    return this.listStages()
+      .filter((row) => row.stage === stage)
+      .map((row) => ({
+        scoutId: row.scoutId,
+        stage: row.stage,
+        title: null,
+        url: exposeUrl(row.scoutId),
+        opened: false,
+        address: null,
+        priceCold: null,
+        priceWarm: null,
+        extraCosts: null,
+        deposit: null,
+        rooms: null,
+        areaSqm: null,
+        floor: null,
+        moveIn: null,
+        description: null,
+        mails: [],
+        viewings: [],
+      }));
   }
 }
 
@@ -374,6 +448,7 @@ export interface Harness {
   listings: InMemoryListings;
   selectors: InMemorySelectors;
   events: InMemoryEvents;
+  progress: InMemoryProgress;
   notifier: FakeNotifier;
   control: FakeControl;
   classifier: RecordingClassifier;
@@ -390,6 +465,7 @@ export function createHarness(): Harness {
   const listings = new InMemoryListings();
   const selectors = new InMemorySelectors();
   const events = new InMemoryEvents();
+  const progress = new InMemoryProgress();
   const notifier = new FakeNotifier();
   const control = new FakeControl();
   const classifier = new RecordingClassifier();
@@ -405,6 +481,7 @@ export function createHarness(): Harness {
     logger,
     clock,
     dryRun: false,
+    progress,
   };
   const inspect: InspectDependencies = {
     browser,
@@ -415,6 +492,7 @@ export function createHarness(): Harness {
     logger,
     clock,
     profile,
+    progress,
   };
   const loop: LoopDependencies = {
     ...apply,
@@ -424,5 +502,5 @@ export function createHarness(): Harness {
     maxApplicationsPerCycle: 5,
     overnightRun: false,
   };
-  return { clock, logger, listings, selectors, events, notifier, control, classifier, browser, profile, loop, apply, inspect };
+  return { clock, logger, listings, selectors, events, progress, notifier, control, classifier, browser, profile, loop, apply, inspect };
 }

@@ -1,14 +1,17 @@
 import { CaptchaEncountered } from "../domain/captcha-signal.js";
 import { exposeUrl } from "../domain/expose-url.js";
 import { Listing } from "../domain/listing.js";
+import { noteListingStatus } from "./note-listing-progress.js";
 import type { BrowserSession } from "./ports/browser-session.js";
 import type { Clock } from "./ports/clock.js";
 import type { ListingRepository } from "./ports/listing-repository.js";
+import type { ProgressLog } from "./ports/progress-log.js";
 
 export interface PollDependencies {
   browser: BrowserSession;
   listings: ListingRepository;
   clock: Clock;
+  progress: ProgressLog;
 }
 
 export async function pollSearch(deps: PollDependencies, searchUrl: string): Promise<Listing[]> {
@@ -30,5 +33,8 @@ export async function pollSearch(deps: PollDependencies, searchUrl: string): Pro
       }),
     );
   deps.listings.insertAll(fresh);
+  for (const listing of fresh) {
+    noteListingStatus(deps, listing);
+  }
   return fresh;
 }

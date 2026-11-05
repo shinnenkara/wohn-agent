@@ -15,8 +15,15 @@ export interface ExposeFacts {
   contactName: string | null;
   description: string;
   priceCold: number | null;
+  priceWarm: number | null;
+  extraCosts: number | null;
+  deposit: string | null;
   rooms: number | null;
   areaSqm: number | null;
+  floor: string | null;
+  moveIn: string | null;
+  address: string | null;
+  snapshot: string;
   isPlusOnly: boolean;
   externalPortal: boolean;
 }

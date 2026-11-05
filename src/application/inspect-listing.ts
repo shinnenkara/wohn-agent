@@ -5,6 +5,7 @@ import type { Listing } from "../domain/listing.js";
 import { DomainError } from "../domain/domain-error.js";
 import { toFailureContext } from "./failure-context.js";
 import { notifySafely } from "./notify.js";
+import { persistListing } from "./note-listing-progress.js";
 import type { BrowserSession } from "./ports/browser-session.js";
 import type { Clock } from "./ports/clock.js";
 import type { EventLog } from "./ports/event-log.js";
@@ -12,6 +13,7 @@ import type { FailureClassifier } from "./ports/failure-classifier.js";
 import type { ListingRepository } from "./ports/listing-repository.js";
 import type { Logger } from "./ports/logger.js";
 import type { Notifier } from "./ports/notifier.js";
+import type { ProgressLog } from "./ports/progress-log.js";
 
 export interface InspectDependencies {
   browser: BrowserSession;
@@ -22,6 +24,7 @@ export interface InspectDependencies {
   logger: Logger;
   clock: Clock;
   profile: ApplicantProfile;
+  progress: ProgressLog;
 }
 
 const EXTERNAL_REASON = "External portal or phone only";
@@ -59,7 +62,7 @@ export async function inspectListing(deps: InspectDependencies, listing: Listing
       createdAt: deps.clock.now(),
     });
     const manual = listing.requireManual(context.message || failure, failure);
-    deps.listings.save(manual);
+    persistListing(deps, manual);
     await notifySafely(deps.notifier, deps.logger, {
       type: "MANUAL_REQUIRED",
       scoutId: manual.scoutId,
@@ -73,19 +76,31 @@ export async function inspectListing(deps: InspectDependencies, listing: Listing
     title: facts.title,
     contactName: facts.contactName,
     priceCold: facts.priceCold,
+    priceWarm: facts.priceWarm,
+    extraCosts: facts.extraCosts,
+    deposit: facts.deposit,
     rooms: facts.rooms,
     areaSqm: facts.areaSqm,
+    floor: facts.floor,
+    moveIn: facts.moveIn,
+    address: facts.address,
+    description: facts.description,
+    snapshot: facts.snapshot,
     isPlusOnly: facts.isPlusOnly,
   });
-  const keyword = matchBlacklist(deps.profile.blacklistKeywords, facts.title, facts.description);
+  const keyword = matchBlacklist(
+    deps.profile.blacklistKeywords,
+    facts.title,
+    `${facts.description}\n${facts.snapshot}`,
+  );
   if (keyword) {
     updated = updated.filterOut(`Keyword match: ${keyword}`);
-    deps.listings.save(updated);
+    persistListing(deps, updated);
     return updated;
   }
   if (facts.externalPortal) {
     updated = updated.requireManual(EXTERNAL_REASON, "EXTERNAL_PORTAL");
-    deps.listings.save(updated);
+    persistListing(deps, updated);
     await notifySafely(deps.notifier, deps.logger, {
       type: "MANUAL_REQUIRED",
       scoutId: updated.scoutId,
@@ -94,6 +109,6 @@ export async function inspectListing(deps: InspectDependencies, listing: Listing
     });
     return updated;
   }
-  deps.listings.save(updated);
+  persistListing(deps, updated);
   return updated;
 }

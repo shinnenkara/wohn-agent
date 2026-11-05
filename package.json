@@ -12,6 +12,9 @@
     "dev": "tsx src/infrastructure/main.ts",
     "test": "node --import tsx --test test/**/*.test.ts",
     "link": "tsx src/infrastructure/link-notify.ts",
+    "login": "tsx src/infrastructure/login-main.ts",
+    "sync": "tsx src/infrastructure/sync-main.ts",
+    "ui": "tsx src/infrastructure/ui-main.ts",
     "chrome": "powershell -ExecutionPolicy Bypass -File scripts/start-chrome.ps1"
   },
   "dependencies": {

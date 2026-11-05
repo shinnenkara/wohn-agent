@@ -12,6 +12,14 @@ interface ListingRow {
   price_cold: number | null;
   rooms: number | null;
   area_sqm: number | null;
+  address: string | null;
+  price_warm: number | null;
+  extra_costs: number | null;
+  deposit: string | null;
+  floor: string | null;
+  move_in: string | null;
+  description: string | null;
+  snapshot: string | null;
   is_plus_only: number | null;
   status: string;
   filter_reason: string | null;
@@ -48,9 +56,10 @@ export class SqliteListingRepository implements ListingRepository {
     }
     const insert = this.db.prepare(`
       INSERT OR IGNORE INTO listings (
-        scout_id, url, title, salutation, price_cold, rooms, area_sqm, is_plus_only,
+        scout_id, url, title, salutation, price_cold, rooms, area_sqm, address, price_warm,
+        extra_costs, deposit, floor, move_in, description, snapshot, is_plus_only,
         status, filter_reason, error_code, retry_count, discovered_at, applied_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     this.db.exec("BEGIN");
     try {
@@ -68,9 +77,10 @@ export class SqliteListingRepository implements ListingRepository {
     this.db
       .prepare(`
         INSERT INTO listings (
-          scout_id, url, title, salutation, price_cold, rooms, area_sqm, is_plus_only,
+          scout_id, url, title, salutation, price_cold, rooms, area_sqm, address, price_warm,
+          extra_costs, deposit, floor, move_in, description, snapshot, is_plus_only,
           status, filter_reason, error_code, retry_count, discovered_at, applied_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(scout_id) DO UPDATE SET
           url = excluded.url,
           title = excluded.title,
@@ -78,6 +88,14 @@ export class SqliteListingRepository implements ListingRepository {
           price_cold = excluded.price_cold,
           rooms = excluded.rooms,
           area_sqm = excluded.area_sqm,
+          address = excluded.address,
+          price_warm = excluded.price_warm,
+          extra_costs = excluded.extra_costs,
+          deposit = excluded.deposit,
+          floor = excluded.floor,
+          move_in = excluded.move_in,
+          description = excluded.description,
+          snapshot = excluded.snapshot,
           is_plus_only = excluded.is_plus_only,
           status = excluded.status,
           filter_reason = excluded.filter_reason,
@@ -115,6 +133,14 @@ function bindListing(data: ListingData): Array<string | number | null> {
     data.priceCold,
     data.rooms,
     data.areaSqm,
+    data.address,
+    data.priceWarm,
+    data.extraCosts,
+    data.deposit,
+    data.floor,
+    data.moveIn,
+    data.description,
+    data.snapshot,
     data.isPlusOnly ? 1 : 0,
     data.status,
     data.filterReason,
@@ -137,6 +163,14 @@ function toListing(row: ListingRow): Listing {
     priceCold: row.price_cold,
     rooms: row.rooms,
     areaSqm: row.area_sqm,
+    address: row.address,
+    priceWarm: row.price_warm,
+    extraCosts: row.extra_costs,
+    deposit: row.deposit,
+    floor: row.floor,
+    moveIn: row.move_in,
+    description: row.description,
+    snapshot: row.snapshot,
     isPlusOnly: row.is_plus_only === 1,
     status: row.status,
     filterReason: row.filter_reason,

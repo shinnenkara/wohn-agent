@@ -6,6 +6,7 @@ import { NoopControl } from "../adapters/control/noop-control.js";
 import { SqliteEventLog } from "../adapters/sqlite/event-log.js";
 import { openDatabase } from "../adapters/sqlite/database.js";
 import { SqliteListingRepository } from "../adapters/sqlite/listing-repository.js";
+import { SqliteProgressLog } from "../adapters/sqlite/progress-log.js";
 import { SqliteSelectorCache } from "../adapters/sqlite/selector-cache-repository.js";
 import { createGeminiClassifier } from "../adapters/stagehand/rules-then-gemini-classifier.js";
 import { StagehandBrowserSession } from "../adapters/stagehand/stagehand-browser.js";
@@ -37,6 +38,11 @@ export function composeWith(config: RuntimeConfig, db: DatabaseSync): Applicatio
   const profile = loadProfile(config.applicantProfilePath);
   const control = new NoopControl();
   const credentials = config.notifyUrl ? loadNotifyCredentials(NOTIFY_CREDENTIALS_PATH) : null;
+  const progress = new SqliteProgressLog(db);
+  const backfilled = progress.backfillListings(systemClock.now());
+  if (backfilled > 0) {
+    logger.info("backfilled apartment progress", { count: backfilled });
+  }
   const browser = new StagehandBrowserSession({
     cdpUrl: config.chromeCdpUrl,
     apiKey: config.googleApiKey,
@@ -60,6 +66,7 @@ export function composeWith(config: RuntimeConfig, db: DatabaseSync): Applicatio
     maxApplicationsPerCycle: config.maxApplicationsPerCycle,
     dryRun: config.dryRun,
     overnightRun: config.overnightRun,
+    progress,
   };
   return {
     loop,

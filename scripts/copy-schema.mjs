@@ -1,7 +1,10 @@
-import { cpSync, mkdirSync } from "node:fs";
+import { cpSync, mkdirSync, readdirSync } from "node:fs";
 
-mkdirSync("dist/adapters/sqlite/migrations", { recursive: true });
-cpSync(
-  "src/adapters/sqlite/migrations/001_init.sql",
-  "dist/adapters/sqlite/migrations/001_init.sql",
-);
+const source = "src/adapters/sqlite/migrations";
+const target = "dist/adapters/sqlite/migrations";
+mkdirSync(target, { recursive: true });
+for (const name of readdirSync(source)) {
+  if (name.endsWith(".sql")) {
+    cpSync(`${source}/${name}`, `${target}/${name}`);
+  }
+}

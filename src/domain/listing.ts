@@ -5,8 +5,16 @@ export interface ExposeDetails {
   title: string;
   contactName: string | null;
   priceCold: number | null;
+  priceWarm?: number | null;
+  extraCosts?: number | null;
+  deposit?: string | null;
   rooms: number | null;
   areaSqm: number | null;
+  floor?: string | null;
+  moveIn?: string | null;
+  address?: string | null;
+  description?: string | null;
+  snapshot?: string | null;
   isPlusOnly: boolean;
 }
 
@@ -18,6 +26,14 @@ export interface ListingData {
   priceCold: number | null;
   rooms: number | null;
   areaSqm: number | null;
+  address: string | null;
+  priceWarm: number | null;
+  extraCosts: number | null;
+  deposit: string | null;
+  floor: string | null;
+  moveIn: string | null;
+  description: string | null;
+  snapshot: string | null;
   isPlusOnly: boolean;
   status: ListingStatus;
   filterReason: string | null;
@@ -52,6 +68,14 @@ export class Listing {
       priceCold: null,
       rooms: null,
       areaSqm: null,
+      address: null,
+      priceWarm: null,
+      extraCosts: null,
+      deposit: null,
+      floor: null,
+      moveIn: null,
+      description: null,
+      snapshot: null,
       isPlusOnly: false,
       status: "DISCOVERED",
       filterReason: null,
@@ -97,6 +121,38 @@ export class Listing {
     return this.data.areaSqm;
   }
 
+  get address(): string | null {
+    return this.data.address;
+  }
+
+  get priceWarm(): number | null {
+    return this.data.priceWarm;
+  }
+
+  get extraCosts(): number | null {
+    return this.data.extraCosts;
+  }
+
+  get deposit(): string | null {
+    return this.data.deposit;
+  }
+
+  get floor(): string | null {
+    return this.data.floor;
+  }
+
+  get moveIn(): string | null {
+    return this.data.moveIn;
+  }
+
+  get description(): string | null {
+    return this.data.description;
+  }
+
+  get snapshot(): string | null {
+    return this.data.snapshot;
+  }
+
   get isPlusOnly(): boolean {
     return this.data.isPlusOnly;
   }
@@ -140,6 +196,14 @@ export class Listing {
       priceCold: details.priceCold,
       rooms: details.rooms,
       areaSqm: details.areaSqm,
+      address: details.address ?? null,
+      priceWarm: details.priceWarm ?? null,
+      extraCosts: details.extraCosts ?? null,
+      deposit: details.deposit ?? null,
+      floor: details.floor ?? null,
+      moveIn: details.moveIn ?? null,
+      description: details.description ?? null,
+      snapshot: details.snapshot ?? null,
       isPlusOnly: details.isPlusOnly,
     });
   }

@@ -11,6 +11,7 @@ import {
 import type { SelectorCacheEntry } from "../domain/selector-cache-entry.js";
 import { ApplicationSent, StepFailure } from "../domain/step-failure.js";
 import { matchValidationFields } from "../domain/validation-fields.js";
+import { persistListing } from "./note-listing-progress.js";
 import { toFailureContext } from "./failure-context.js";
 import { notifySafely } from "./notify.js";
 import type { BrowserSession, CachedSelector, ObservedAction } from "./ports/browser-session.js";
@@ -20,6 +21,7 @@ import type { FailureClassifier } from "./ports/failure-classifier.js";
 import type { ListingRepository } from "./ports/listing-repository.js";
 import type { Logger } from "./ports/logger.js";
 import type { Notifier } from "./ports/notifier.js";
+import type { ProgressLog } from "./ports/progress-log.js";
 import type { SelectorCache } from "./ports/selector-cache.js";
 
 export interface ApplyDependencies {
@@ -32,6 +34,7 @@ export interface ApplyDependencies {
   logger: Logger;
   clock: Clock;
   dryRun: boolean;
+  progress: ProgressLog;
 }
 
 export type ApplyResult =
@@ -56,7 +59,7 @@ export async function applyToListing(
     throw new DomainError(`Cannot apply to listing in status ${listing.status}`);
   }
   let current = listing.startApplying();
-  deps.listings.save(current);
+  persistListing(deps, current);
   const counts = emptyRecoveryCounts();
   // Locate the submit button before pasting the message so that observe()
   // snapshots do not include the rendered application text.
@@ -113,7 +116,7 @@ export async function applyToListing(
       if (deps.dryRun) {
         deps.logger.preview(formatDryRunPreview(current, message));
         current = current.releaseUnsent();
-        deps.listings.save(current);
+        persistListing(deps, current);
         return { kind: "previewed", listing: current };
       }
       const check = await deps.browser.submit(submitSelector);
@@ -176,7 +179,7 @@ function requeueForCaptcha(
   error: CaptchaEncountered,
 ): CaptchaEncountered {
   if (current.status === "APPLYING") {
-    deps.listings.save(current.requeue("CAPTCHA_HIT"));
+    persistListing(deps, current.requeue("CAPTCHA_HIT"));
   }
   return error;
 }
@@ -210,7 +213,7 @@ async function heal(
 
   if (decision.terminal === "BREAKER") {
     const requeued = input.current.status === "APPLYING" ? input.current.requeue("CAPTCHA_HIT") : input.current;
-    deps.listings.save(requeued);
+    persistListing(deps, requeued);
     throw new CaptchaEncountered({ kind: "title", detail: context.message || "CAPTCHA_HIT" });
   }
   if (decision.terminal === "FAILED") {
@@ -261,13 +264,13 @@ async function heal(
     return { result: null, listing: input.current };
   }
   const released = input.current.releaseForRetry(failure).startApplying();
-  deps.listings.save(released);
+  persistListing(deps, released);
   return { result: null, listing: released };
 }
 
 async function finishApplied(deps: ApplyDependencies, current: Listing): Promise<ApplyResult> {
   const applied = current.status === "APPLYING" ? current.markApplied(deps.clock.now()) : current;
-  deps.listings.save(applied);
+  persistListing(deps, applied);
   deps.logger.info("application sent", { scoutId: applied.scoutId, title: applied.title ?? applied.scoutId });
   await notifySafely(deps.notifier, deps.logger, {
     type: "APPLIED",
@@ -280,7 +283,7 @@ async function finishApplied(deps: ApplyDependencies, current: Listing): Promise
 
 function finishFailed(deps: ApplyDependencies, current: Listing, errorCode: string): ApplyResult {
   const failed = current.status === "APPLYING" ? current.markFailed(errorCode) : current;
-  deps.listings.save(failed);
+  persistListing(deps, failed);
   return { kind: "failed", listing: failed };
 }
 
@@ -291,7 +294,7 @@ async function finishManual(
   errorCode: string,
 ): Promise<ApplyResult> {
   const manual = current.status === "MANUAL_REQUIRED" ? current : current.requireManual(reason, errorCode);
-  deps.listings.save(manual);
+  persistListing(deps, manual);
   await notifySafely(deps.notifier, deps.logger, {
     type: "MANUAL_REQUIRED",
     scoutId: manual.scoutId,

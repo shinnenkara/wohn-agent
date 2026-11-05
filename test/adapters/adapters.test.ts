@@ -149,6 +149,48 @@ describe("listing text, profile, and alerts", () => {
     assert.deepEqual(uniqueScoutIds(["12", "165686634", "165686634", "abc"]), ["165686634"]);
   });
 
+  it("keeps a labeled cold rent and ignores a year next to Zimmer", () => {
+    const facts = interpretExpose({
+      title: "Altbau",
+      contactName: null,
+      description: "Ruhige Wohnung.",
+      bodyText: [
+        "Aktualisiert 2026 Zimmer",
+        "Kaltmiete",
+        "1.100 €",
+        "Warmmiete",
+        "1.280 €",
+        "Nebenkosten",
+        "180 €",
+        "Kaution",
+        "3 Nettokaltmieten",
+        "Wohnfläche",
+        "55 m²",
+        "2 Zimmer",
+        "Etage",
+        "3. OG",
+        "Bezugsfrei ab",
+        "01.03.2026",
+        "Adresse",
+        "Badstr. 54, 13357 Berlin",
+      ].join("\n"),
+      hasMessageButton: true,
+      hasExternalLink: false,
+      hasPhoneOnly: false,
+    });
+    assert.equal(facts.rooms, 2);
+    assert.equal(facts.priceCold, 1100);
+    assert.equal(facts.priceWarm, 1280);
+    assert.equal(facts.extraCosts, 180);
+    assert.equal(facts.deposit, "3 Nettokaltmieten");
+    assert.equal(facts.areaSqm, 55);
+    assert.equal(facts.floor, "3. OG");
+    assert.equal(facts.moveIn, "01.03.2026");
+    assert.equal(facts.address, "Badstr. 54, 13357 Berlin");
+    assert.equal(facts.description, "Ruhige Wohnung.");
+    assert.match(facts.snapshot, /Kaltmiete/);
+  });
+
   it("loads the example profile and formats alerts without income", () => {
     const profile = loadProfile("applicant_profile.example.json");
     assert.equal(profile.formData.lastName, "Mustermann");

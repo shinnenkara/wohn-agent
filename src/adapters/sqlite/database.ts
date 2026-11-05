@@ -1,6 +1,5 @@
-import { readFileSync } from "node:fs";
-import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 
@@ -14,10 +13,43 @@ export function openDatabase(path: string): DatabaseSync {
   }
   db.exec("PRAGMA busy_timeout = 5000");
   db.exec(loadSchemaSql());
+  ensureListingColumns(db);
+  return db;
+}
+
+export function openReadOnlyDatabase(path: string): DatabaseSync {
+  const db = new DatabaseSync(path, { readOnly: true });
+  db.exec("PRAGMA query_only = ON");
+  db.exec("PRAGMA busy_timeout = 5000");
   return db;
 }
 
 function loadSchemaSql(): string {
-  const url = new URL("./migrations/001_init.sql", import.meta.url);
-  return readFileSync(fileURLToPath(url), "utf8");
+  const dir = fileURLToPath(new URL("./migrations/", import.meta.url));
+  return readdirSync(dir)
+    .filter((name) => name.endsWith(".sql"))
+    .sort()
+    .map((name) => readFileSync(join(dir, name), "utf8"))
+    .join("\n");
+}
+
+const LISTING_COLUMNS: ReadonlyArray<readonly [string, string]> = [
+  ["address", "TEXT"],
+  ["price_warm", "REAL"],
+  ["extra_costs", "REAL"],
+  ["deposit", "TEXT"],
+  ["floor", "TEXT"],
+  ["move_in", "TEXT"],
+  ["description", "TEXT"],
+  ["snapshot", "TEXT"],
+];
+
+function ensureListingColumns(db: DatabaseSync): void {
+  const rows = db.prepare("PRAGMA table_info(listings)").all() as Array<{ name: string }>;
+  const names = new Set(rows.map((row) => row.name));
+  for (const [name, type] of LISTING_COLUMNS) {
+    if (!names.has(name)) {
+      db.exec(`ALTER TABLE listings ADD COLUMN ${name} ${type}`);
+    }
+  }
 }

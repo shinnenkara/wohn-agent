@@ -528,11 +528,12 @@ export class StagehandBrowserSession implements BrowserSession {
       });
     }
     return {
+      ...fallback,
       title: parsed.data.title,
       contactName: parsed.data.contactName ?? fallback.contactName,
-      description: parsed.data.description ?? fallback.description,
+      description: parsed.data.description || fallback.description,
       priceCold: parsed.data.priceCold ?? fallback.priceCold,
-      rooms: parsed.data.rooms ?? fallback.rooms,
+      rooms: plausibleRooms(parsed.data.rooms) ?? fallback.rooms,
       areaSqm: parsed.data.areaSqm ?? fallback.areaSqm,
       isPlusOnly: parsed.data.isPlusOnly ?? fallback.isPlusOnly,
       externalPortal: parsed.data.externalPortal ?? fallback.externalPortal,
@@ -878,4 +879,11 @@ function parseJsonObject(text: string): unknown {
   } catch {
     return null;
   }
+}
+
+function plausibleRooms(value: number | null | undefined): number | null {
+  if (value === null || value === undefined || value <= 0 || value > 20) {
+    return null;
+  }
+  return value;
 }
