@@ -11,6 +11,7 @@
     "start": "node dist/infrastructure/main.js",
     "dev": "tsx src/infrastructure/main.ts",
     "test": "node --import tsx --test test/**/*.test.ts",
+    "link": "tsx src/infrastructure/link-notify.ts",
     "chrome": "powershell -ExecutionPolicy Bypass -File scripts/start-chrome.ps1"
   },
   "dependencies": {

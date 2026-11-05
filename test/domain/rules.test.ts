@@ -4,13 +4,16 @@ import { matchBlacklist } from "../../src/domain/blacklist.js";
 import { CaptchaBreaker } from "../../src/domain/circuit-breaker.js";
 import {
   classifyCaptchaWidgets,
+  textIndicatesApplicationSent,
+  textIndicatesSendCaptcha,
   titleIndicatesCaptcha,
   titleIsClearOfCaptcha,
   type CaptchaWidget,
 } from "../../src/domain/captcha-signal.js";
 import { DomainError } from "../../src/domain/domain-error.js";
 import { Listing } from "../../src/domain/listing.js";
-import { renderMessage } from "../../src/domain/message-template.js";
+import { selectContactName } from "../../src/domain/contact-name.js";
+import { buildGreeting, renderMessage } from "../../src/domain/message-template.js";
 import { decideRecovery, emptyRecoveryCounts } from "../../src/domain/recovery-policy.js";
 import {
   betweenListingDelayMs,
@@ -76,9 +79,60 @@ describe("listing status", () => {
 });
 
 describe("message, blacklist, and validation", () => {
-  it("falls back when the contact name is missing", () => {
-    const rendered = renderMessage("Hallo {{contact_name}} zu {{title}}", "  ", "Altbau");
-    assert.equal(rendered, "Hallo Damen und Herren zu Altbau");
+  it("builds a salutation and keeps the letter body separate", () => {
+    const cases: Array<{ name: string; template: string; greeting: string; message: string }> = [
+      { name: "", template: "", greeting: "Guten Tag,", message: "Guten Tag," },
+      {
+        name: "Frau Anna Schmidt",
+        template: "Wir sind interessiert.",
+        greeting: "Sehr geehrte Frau Schmidt,",
+        message: "Sehr geehrte Frau Schmidt,\n\nWir sind interessiert.",
+      },
+      { name: "Herr Max Müller", template: "", greeting: "Sehr geehrter Herr Müller,", message: "Sehr geehrter Herr Müller," },
+      { name: "Herr Dr. Max Müller", template: "", greeting: "Sehr geehrter Herr Müller,", message: "Sehr geehrter Herr Müller," },
+      { name: "Frau Prof. Dr. Lisa Klein", template: "", greeting: "Sehr geehrte Frau Klein,", message: "Sehr geehrte Frau Klein," },
+      { name: "Herr Dipl.-Ing. Klaus Weber", template: "", greeting: "Sehr geehrter Herr Weber,", message: "Sehr geehrter Herr Weber," },
+      { name: "Frau", template: "", greeting: "Guten Tag,", message: "Guten Tag," },
+      { name: "Hausverwaltung GmbH", template: "", greeting: "Sehr geehrte Damen und Herren,", message: "Sehr geehrte Damen und Herren," },
+      { name: "Beispiel AG", template: "", greeting: "Sehr geehrte Damen und Herren,", message: "Sehr geehrte Damen und Herren," },
+      { name: "Nur ein Name", template: "", greeting: "Guten Tag,", message: "Guten Tag," },
+      { name: "Herr M. Handke -", template: "", greeting: "Sehr geehrter Herr M. Handke,", message: "Sehr geehrter Herr M. Handke," },
+      {
+        name: "Herr Ihr Vermietungsteam der berlinovo",
+        template: "",
+        greeting: "Sehr geehrte Damen und Herren,",
+        message: "Sehr geehrte Damen und Herren,",
+      },
+    ];
+    for (const item of cases) {
+      assert.equal(buildGreeting(item.name), item.greeting);
+      assert.equal(renderMessage(item.template, item.name, ""), item.message);
+    }
+    assert.equal(
+      renderMessage("Interesse an {{title}}.", "Frau Anna Schmidt", "Altbau"),
+      "Sehr geehrte Frau Schmidt,\n\nInteresse an Altbau.",
+    );
+  });
+
+  it("prefers a person name and skips contact-card chrome", () => {
+    assert.equal(
+      selectContactName([
+        { text: "Telefonnummer anzeigen", named: true, hasControls: true },
+        { text: "Nachricht schreiben", named: false, hasControls: false },
+        { text: "Frau Anna Schmidt", named: false, hasControls: false },
+        { text: "Frau Anna Schmidt, Hausverwaltung", named: false, hasControls: false },
+      ]),
+      "Frau Anna Schmidt",
+    );
+    assert.equal(
+      selectContactName([{ text: "Max Müller", named: true, hasControls: false }]),
+      "Max Müller",
+    );
+    assert.equal(
+      selectContactName([{ text: "Hausverwaltung GmbH", named: false, hasControls: false }]),
+      "Hausverwaltung GmbH",
+    );
+    assert.equal(selectContactName([]), null);
   });
 
   it("matches blacklist keywords without changing their spelling", () => {
@@ -87,8 +141,12 @@ describe("message, blacklist, and validation", () => {
   });
 
   it("maps German validation text onto profile fields", () => {
-    assert.deepEqual(matchValidationFields("Einkommen ist ein Pflichtfeld"), ["monthlyNetIncome"]);
+    assert.deepEqual(matchValidationFields("Einkommen ist ein Pflichtfeld"), ["incomeAmount"]);
     assert.deepEqual(matchValidationFields("Bitte Haustiere angeben"), ["hasPets"]);
+    assert.deepEqual(matchValidationFields("Gewerbliche Nutzung"), ["forCommercialPurposes"]);
+    assert.deepEqual(matchValidationFields("Mietrückstände in den letzten 5 Jahren"), ["rentArrears"]);
+    assert.deepEqual(matchValidationFields("Insolvenzverfahren"), ["insolvencyProcess"]);
+    assert.deepEqual(matchValidationFields("Raucher:in ist ein Pflichtfeld"), ["smoker"]);
     assert.deepEqual(matchValidationFields("Unbekanntes Feld"), []);
   });
 });
@@ -137,6 +195,11 @@ describe("captcha breaker and hours", () => {
     assert.equal(titleIndicatesCaptcha("Ich bin kein Roboter"), true);
     assert.equal(titleIsClearOfCaptcha(""), false);
     assert.equal(titleIsClearOfCaptcha("Wohnung mieten"), true);
+    assert.equal(textIndicatesApplicationSent("Nachricht gesendet"), true);
+    assert.equal(textIndicatesApplicationSent("Interesse bekundet"), true);
+    assert.equal(textIndicatesApplicationSent("Interesse bekunden"), false);
+    assert.equal(textIndicatesSendCaptcha("Sicherheitsabfrage"), true);
+    assert.equal(textIndicatesSendCaptcha("Zeichen aus dem Bild eingeben"), true);
   });
 
   it("ignores the hidden recaptcha frame embedded on a normal page", () => {

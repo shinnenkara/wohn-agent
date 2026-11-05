@@ -69,7 +69,10 @@ describe("apply", () => {
     });
     const result = await applyToListing(harness.apply, listing, harness.profile);
     assert.equal(result.kind, "applied");
-    assert.equal(harness.browser.messages[0], "Sehr geehrte(r) Frau Müller, Interesse an Altbau. Tel +49 170 0000000");
+    assert.equal(
+      harness.browser.messages[0],
+      "Sehr geehrte Frau Müller,\n\nInteresse an Altbau. Tel +49 170 0000000",
+    );
     assert.equal(harness.classifier.contexts.length, 0);
     assert.equal(harness.selectors.get("open_contact_drawer")?.selector, "#contact");
     assert.equal(harness.notifier.alerts[0]?.type, "APPLIED");
@@ -124,6 +127,35 @@ describe("apply", () => {
     assert.equal(harness.browser.closePopups, 2);
   });
 
+  it("uses the contact name on the form when the saved salutation differs", async () => {
+    const harness = createHarness();
+    harness.browser.liveContactName = "Herr Dr. Max Müller";
+    const listing = discoverListing().withDetails({
+      title: "Altbau",
+      contactName: "Frau Müller",
+      priceCold: null,
+      rooms: null,
+      areaSqm: null,
+      isPlusOnly: false,
+    });
+    const result = await applyToListing(harness.apply, listing, harness.profile);
+    assert.equal(result.kind, "applied");
+    assert.equal(
+      harness.browser.messages[0],
+      "Sehr geehrter Herr Müller,\n\nInteresse an Altbau. Tel +49 170 0000000",
+    );
+  });
+
+  it("stops before sending when required fields stay empty", async () => {
+    const harness = createHarness();
+    harness.browser.unfilledRequired = true;
+    const result = await applyToListing(harness.apply, discoverListing(), harness.profile);
+    assert.equal(result.kind, "manual");
+    assert.equal(result.listing.errorCode, "VALIDATION_ERROR");
+    assert.equal(harness.browser.submitSelectors.length, 0);
+    assert.equal(harness.browser.messages.length, 0);
+  });
+
   it("asks for help when validation cannot be mapped or the file input is required", async () => {
     const harness = createHarness();
     harness.browser.submitErrors = [
@@ -154,7 +186,7 @@ describe("apply", () => {
     const result = await applyToListing(harness.apply, discoverListing(), harness.profile);
     assert.equal(result.kind, "manual");
     assert.equal(harness.browser.filledFields.length, 2);
-    assert.deepEqual(harness.browser.filledFields[0], ["monthlyNetIncome"]);
+    assert.deepEqual(harness.browser.filledFields[0], ["incomeAmount"]);
     assert.equal(harness.browser.submitSelectors.length, 3);
   });
 
@@ -240,6 +272,21 @@ describe("agent loop", () => {
     assert.equal(harness.browser.checkboxClicks, 0);
     assert.equal(harness.browser.reloads, 1);
     assert.equal(harness.notifier.alerts[0]?.type, "CAPTCHA_OPEN");
+
+    const rateLimit = createHarness();
+    rateLimit.browser.captchaQueue = [{ kind: "selector", detail: "sicherheitsabfrage" }];
+    const paused = await runTick(rateLimit.loop, idleState(), new AbortController().signal);
+    assert.equal(paused.breaker.state, "OPEN");
+    assert.equal(rateLimit.browser.reloads, 0);
+    assert.equal(rateLimit.notifier.alerts[0]?.type, "CAPTCHA_OPEN");
+    assert.equal(rateLimit.logger.messages.includes("captcha paused the loop"), true);
+
+    const robotPage = createHarness();
+    robotPage.browser.captchaQueue = [{ kind: "title", detail: "Ich bin kein Roboter" }];
+    const robot = await runTick(robotPage.loop, idleState(), new AbortController().signal);
+    assert.equal(robot.breaker.state, "OPEN");
+    assert.equal(robotPage.browser.reloads, 0);
+    assert.equal(robotPage.notifier.alerts[0]?.type, "CAPTCHA_OPEN");
 
     const checkbox = createHarness();
     checkbox.browser.captchaQueue = [

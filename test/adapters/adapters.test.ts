@@ -3,14 +3,16 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { parseEnv } from "../../src/adapters/config/env.js";
-import { loadProfile } from "../../src/adapters/config/load-profile.js";
+import { SHARED_NOTIFY_URL, parseEnv } from "../../src/adapters/config/env.js";
+import { loadProfile, parseProfile } from "../../src/adapters/config/load-profile.js";
 import { openDatabase } from "../../src/adapters/sqlite/database.js";
 import { SqliteEventLog } from "../../src/adapters/sqlite/event-log.js";
 import { SqliteListingRepository } from "../../src/adapters/sqlite/listing-repository.js";
 import { SqliteSelectorCache } from "../../src/adapters/sqlite/selector-cache-repository.js";
 import { classifyByRules } from "../../src/adapters/stagehand/classify-by-rules.js";
 import { interpretExpose, parseGermanAmount, uniqueScoutIds } from "../../src/adapters/stagehand/parse-listing-text.js";
+import { isSubmitLabel, pickOpenerIndex } from "../../src/adapters/stagehand/contact-opener.js";
+import { namedFillPlan } from "../../src/adapters/stagehand/named-fields.js";
 import { toStagehandVariables, validationInstruction } from "../../src/adapters/stagehand/profile-variables.js";
 import {
   MESSAGE_FIELD_INSTRUCTION,
@@ -21,7 +23,7 @@ import {
   parseClassifierDecision,
   RulesThenGeminiClassifier,
 } from "../../src/adapters/stagehand/rules-then-gemini-classifier.js";
-import { CAPTCHA_ALERT_TEXT, formatAlert } from "../../src/adapters/telegram/telegram-notifier.js";
+import { CAPTCHA_ALERT_TEXT, formatAlert } from "../../src/adapters/notify/format-alert.js";
 import type { FailureContext } from "../../src/application/ports/failure-classifier.js";
 import { discoverListing, sampleProfile } from "../fakes.js";
 
@@ -119,6 +121,10 @@ describe("classifier", () => {
     assert.equal(MESSAGE_FIELD_INSTRUCTION.includes("{{"), false);
     assert.equal(validationInstruction(["phone"]).includes(profile.formData.phone), false);
     assert.equal(toStagehandVariables(profile.formData).phone?.value, profile.formData.phone);
+    assert.equal(toStagehandVariables(profile.formData).email, undefined);
+    assert.equal(toStagehandVariables(profile.formData).send_application_package, undefined);
+    assert.equal(toStagehandVariables(profile.formData).incomeAmount?.value, "4200");
+    assert.equal(toStagehandVariables(profile.formData, ["sendApplicationPackage"]).send_application_package?.value, true);
   });
 });
 
@@ -146,13 +152,69 @@ describe("listing text, profile, and alerts", () => {
   it("loads the example profile and formats alerts without income", () => {
     const profile = loadProfile("applicant_profile.example.json");
     assert.equal(profile.formData.lastName, "Mustermann");
+    assert.equal(profile.formData.email, "");
+    assert.equal(profile.formData.incomeAmount, "4200");
+    assert.equal(profile.formData.moveInDateType, "FROM_NOW");
+    assert.equal(profile.formData.employmentStatus, "INDEFINITE_PERIOD");
     assert.equal(profile.blacklistKeywords[0], "tauschwohnung");
+    const legacy = parseProfile({
+      search_urls: profile.searchUrls,
+      blacklist_keywords: ["tauschwohnung"],
+      message_template: profile.messageTemplate,
+      form_data: {
+        salutation: profile.formData.salutation,
+        first_name: profile.formData.firstName,
+        last_name: profile.formData.lastName,
+        email: profile.formData.email,
+        phone: profile.formData.phone,
+        street: profile.formData.street,
+        house_number: profile.formData.houseNumber,
+        postcode: profile.formData.postcode,
+        city: profile.formData.city,
+        move_in_date_type: profile.formData.moveInDateType,
+        move_in_date: profile.formData.moveInDate,
+        number_of_adults: profile.formData.numberOfAdults,
+        number_of_kids: profile.formData.numberOfKids,
+        has_pets: profile.formData.hasPets,
+        pet_details: profile.formData.petDetails,
+        employment_status: profile.formData.employmentStatus,
+        monthly_net_income: "4200",
+        for_commercial_purposes: profile.formData.forCommercialPurposes,
+        rent_arrears: profile.formData.rentArrears,
+        insolvency_process: profile.formData.insolvencyProcess,
+        smoker: profile.formData.smoker,
+        schufa_available: profile.formData.schufaAvailable,
+        send_application_package: profile.formData.sendApplicationPackage,
+      },
+    });
+    assert.equal(legacy.formData.incomeAmount, "4200");
+    assert.equal(legacy.formData.email, "");
+    const plan = namedFillPlan(profile.formData);
+    assert.equal(plan.salutationLabel, "Herr");
+    assert.equal(plan.salutationValue, "MALE");
+    assert.equal(plan.moveInDateType, "FROM_NOW");
+    assert.equal(plan.inputs.find((field) => field.name === "incomeAmount")?.value, "4200");
+    assert.equal(plan.selects.find((field) => field.name === "hasPets")?.value, "FALSE");
+    assert.equal(plan.selects.find((field) => field.name === "employmentStatus")?.value, "INDEFINITE_PERIOD");
+    assert.equal(plan.labelFills.some((field) => field.pattern.includes("e-?mail")), false);
+    const incomeOnly = namedFillPlan(profile.formData, ["incomeAmount"]);
+    assert.deepEqual(incomeOnly.inputs, [{ name: "incomeAmount", value: "4200" }]);
+    assert.equal(incomeOnly.moveInDateType, "");
+    assert.equal(incomeOnly.salutationLabel, "");
+    const openers = [
+      { text: "Nachricht senden", tag: "BUTTON", role: "", hint: "", href: "", type: "submit" },
+      { text: "Kontakt", tag: "A", role: "", hint: "", href: "https://example.test/kontakt", type: "" },
+      { text: "Nachricht schreiben", tag: "BUTTON", role: "", hint: "contact-button", href: "", type: "" },
+    ];
+    assert.equal(pickOpenerIndex(openers), 2);
+    assert.equal(pickOpenerIndex([{ text: "Absenden", tag: "BUTTON", role: "", hint: "kontakt", href: "", type: "" }]), -1);
+    assert.equal(isSubmitLabel("Abschicken"), true);
+    assert.equal(isSubmitLabel("Nachricht"), false);
     const source = {
       GOOGLE_GENERATIVE_AI_API_KEY: "key",
-      TELEGRAM_BOT_TOKEN: "token",
-      TELEGRAM_CHAT_ID: "42",
     };
     const config = parseEnv(source);
+    assert.equal(config.notifyUrl, SHARED_NOTIFY_URL);
     assert.equal(config.modelName, "google/gemini-3.8-flash");
     assert.equal(config.maxApplicationsPerCycle, 5);
     assert.equal(config.dryRun, false);
@@ -163,6 +225,8 @@ describe("listing text, profile, and alerts", () => {
     assert.equal(parseEnv({ ...source, APP_ENV: "dev" }).appEnv, "dev");
     assert.equal(parseEnv({ ...source, APP_ENV: " DEV " }).appEnv, "dev");
     assert.throws(() => parseEnv({ ...source, APP_ENV: "staging" }));
+    assert.equal(parseEnv({ ...source, NOTIFY_URL: "https://notify.example" }).notifyUrl, "https://notify.example");
+    assert.throws(() => parseEnv({ ...source, NOTIFY_URL: "nope" }));
     assert.equal(formatAlert({ type: "CAPTCHA_OPEN" }), CAPTCHA_ALERT_TEXT);
     const applied = formatAlert({
       type: "APPLIED",

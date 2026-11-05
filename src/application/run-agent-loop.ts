@@ -1,6 +1,6 @@
 import type { ApplicantProfile } from "../domain/applicant-profile.js";
 import { CaptchaBreaker } from "../domain/circuit-breaker.js";
-import { CaptchaEncountered, titleIsClearOfCaptcha, type CaptchaSignal } from "../domain/captcha-signal.js";
+import { CaptchaEncountered, pausesSendingImmediately, titleIsClearOfCaptcha, type CaptchaSignal } from "../domain/captcha-signal.js";
 import type { RandomSource } from "../domain/timing.js";
 import {
   betweenListingDelayMs,
@@ -236,17 +236,30 @@ export async function runTick(
 
 async function watchCaptcha(deps: LoopDependencies, state: LoopState): Promise<LoopState> {
   try {
+    const captcha = await deps.browser.detectCaptcha();
+    if (captcha) {
+      return { ...state, sleepMs: WATCHDOG_INTERVAL_MS };
+    }
     const title = await deps.browser.readTitle();
     if (titleIsClearOfCaptcha(title)) {
+      deps.logger.info("captcha cleared; resuming");
       deps.control.consumeResume();
       return { ...state, breaker: state.breaker.recordCleared(), sleepMs: 0 };
     }
   } catch (error) {
-    deps.logger.error("captcha watchdog could not read the page title", {
+    deps.logger.error("captcha watchdog could not read the page", {
       message: errorMessage(error),
     });
   }
   return { ...state, sleepMs: WATCHDOG_INTERVAL_MS };
+}
+
+function openBreaker(breaker: CaptchaBreaker): CaptchaBreaker {
+  let next = breaker;
+  while (next.state !== "OPEN") {
+    next = next.recordDetection();
+  }
+  return next;
 }
 
 async function handleCaptcha(
@@ -255,16 +268,17 @@ async function handleCaptcha(
   signal: AbortSignal,
   captcha: CaptchaSignal,
 ): Promise<LoopState> {
+  const detected = pausesSendingImmediately(captcha) ? openBreaker(state.breaker) : state.breaker.recordDetection();
   deps.events.append({
     scoutId: null,
     step: "CAPTCHA",
     errorType: "CAPTCHA_HIT",
     domSnippet: captcha.detail.slice(0, 2000),
-    resolutionAction: state.breaker.state === "CLOSED" ? "HALF_OPEN" : "OPEN",
+    resolutionAction: detected.state,
     createdAt: deps.clock.now(),
   });
-  const detected = state.breaker.recordDetection();
   if (detected.state === "OPEN") {
+    deps.logger.info("captcha paused the loop");
     await notifySafely(deps.notifier, deps.logger, { type: "CAPTCHA_OPEN" });
     return { ...state, breaker: detected, sleepMs: WATCHDOG_INTERVAL_MS };
   }

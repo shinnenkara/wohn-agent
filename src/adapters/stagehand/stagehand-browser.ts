@@ -20,14 +20,17 @@ import type { FormData, ProfileField } from "../../domain/applicant-profile.js";
 import {
   CaptchaEncountered,
   classifyCaptchaWidgets,
+  pausesSendingImmediately,
+  textIndicatesApplicationSent,
+  textIndicatesSendCaptcha,
   titleIndicatesCaptcha,
   type CaptchaSignal,
   type CaptchaWidget,
 } from "../../domain/captcha-signal.js";
 import type { ActionMethod } from "../../domain/selector-cache-entry.js";
-import { StepFailure } from "../../domain/step-failure.js";
+import { ApplicationSent, StepFailure } from "../../domain/step-failure.js";
 import type { AgentStep } from "../../domain/agent-event.js";
-import { CACHED_SELECTOR_TIMEOUT_MS, SUBMIT_CONFIRMATION_TIMEOUT_MS } from "../../domain/timing.js";
+import { CACHED_SELECTOR_TIMEOUT_MS } from "../../domain/timing.js";
 import {
   CLOSE_POPUP_INSTRUCTION,
   CONTACT_BUTTON_INSTRUCTION,
@@ -36,6 +39,10 @@ import {
   REQUIRED_FIELDS_INSTRUCTION,
   SUBMIT_BUTTON_INSTRUCTION,
 } from "./instructions.js";
+import { selectContactName, type ContactCandidate } from "../../domain/contact-name.js";
+import { pickOpenerIndex, type OpenerCandidate } from "./contact-opener.js";
+import { runFormPage, type FormFillReport, type FormPageCommand, type FormPageResult } from "./form-page.js";
+import { namedFillPlan, type NamedFillPlan } from "./named-fields.js";
 import { interpretExpose, uniqueScoutIds, type RawExpose } from "./parse-listing-text.js";
 import { toStagehandVariables, validationInstruction, type StagehandVariable } from "./profile-variables.js";
 
@@ -147,7 +154,29 @@ export class StagehandBrowserSession implements BrowserSession {
           visible: shown(node),
         }));
       });
-      return classifyCaptchaWidgets(widgets);
+      const widget = classifyCaptchaWidgets(widgets);
+      if (widget) {
+        return widget;
+      }
+      const text = await evaluateOnPage(page, () => document.body?.innerText ?? "");
+      if (textIndicatesSendCaptcha(text) || titleIndicatesCaptcha(text)) {
+        return textIndicatesSendCaptcha(text)
+          ? { kind: "selector", detail: "sicherheitsabfrage" }
+          : { kind: "title", detail: "Ich bin kein Roboter" };
+      }
+      const pageChallenge = await evaluateOnPage(page, () => {
+        const node = document.querySelector("#captcha-container, awswaf-captcha");
+        if (!node) {
+          return false;
+        }
+        const style = getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.display !== "none" && style.visibility !== "hidden" && rect.width >= 8 && rect.height >= 8;
+      });
+      if (pageChallenge) {
+        return { kind: "title", detail: "Ich bin kein Roboter" };
+      }
+      return null;
     });
   }
 
@@ -188,7 +217,7 @@ export class StagehandBrowserSession implements BrowserSession {
         const hasPhoneOnly = /tel:/i.test(document.body?.innerHTML ?? "") && !hasMessageButton;
         return {
           title: text("h1"),
-          contactName: text('[data-qa="contactName"]') || text('[data-qa="contact-name"]') || null,
+          contactName: null,
           description: text('[data-qa="expose-description"]') || text("#expose-description"),
           bodyText,
           hasMessageButton,
@@ -196,6 +225,7 @@ export class StagehandBrowserSession implements BrowserSession {
           hasPhoneOnly,
         };
       });
+      raw.contactName = await this.contactNameOn(page);
       const facts = interpretExpose(raw);
       if (facts.title.trim()) {
         return facts;
@@ -204,8 +234,57 @@ export class StagehandBrowserSession implements BrowserSession {
     });
   }
 
+  async readContactName(): Promise<string | null> {
+    return this.guard(async () => this.contactNameOn(await this.page()));
+  }
+
   async openContact(cached: CachedSelector | null): Promise<ObservedAction> {
-    return this.guard(() => this.clickOrDiscover(cached, CONTACT_BUTTON_INSTRUCTION, "FILL_FORM", true));
+    return this.guard(async () => {
+      const page = await this.page();
+      let opened = false;
+      for (let index = 0; index < 3 && !opened; index += 1) {
+        const clicked = await clickCssAt(page, CONTACT_BUTTON_SELECTOR, index);
+        if (!clicked) {
+          break;
+        }
+        opened = await this.waitForMessage(page, 3000);
+        if (!opened && (await this.pageShowsApplicationSent(page))) {
+          throw new ApplicationSent();
+        }
+      }
+      if (!opened) {
+        const base = (await page.url()).split("#")[0];
+        await page.goto(`${base}#/basicContact/email`, { waitUntil: "domcontentloaded", timeout: 20_000 }).catch(() => undefined);
+        opened = await this.waitForMessage(page, 4000);
+      }
+      if (!opened && (await this.pageShowsApplicationSent(page))) {
+        throw new ApplicationSent();
+      }
+      if (!opened) {
+        throw new StepFailure("FILL_FORM", "contact form did not open", { name: "TimeoutError" });
+      }
+      return {
+        instruction: CONTACT_BUTTON_INSTRUCTION,
+        selector: CONTACT_BUTTON_SELECTOR,
+        method: "click",
+      };
+    });
+  }
+
+  private async pageShowsApplicationSent(page: Page): Promise<boolean> {
+    const text = await evaluateOnPage(page, () => document.body?.innerText ?? "");
+    return textIndicatesApplicationSent(text);
+  }
+
+  private async waitForMessage(page: Page, timeoutMs: number): Promise<boolean> {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      if ((await this.formPage(page, { op: "has-message" })) === true) {
+        return true;
+      }
+      await page.waitForTimeout(250);
+    }
+    return false;
   }
 
   async fillRequiredFields(variables: FormData): Promise<FillFieldsResult> {
@@ -215,13 +294,14 @@ export class StagehandBrowserSession implements BrowserSession {
         'form input[type="file"][required], form input[type="file"][aria-required="true"]',
       );
       if ((await requiredFile.count({ timeout: 1000 })) > 0) {
-        return { requiresFileUpload: true };
+        return { requiresFileUpload: true, unfilledRequired: false };
       }
-      await this.actOnDiscoveredFields(page, REQUIRED_FIELDS_INSTRUCTION, toStagehandVariables(variables));
+      const named = await this.applyNamedFill(page, namedFillPlan(variables));
       if (variables.sendApplicationPackage) {
         await this.toggleApplicationPackage(page);
       }
-      return { requiresFileUpload: false };
+      const after = asFillReport(await this.formPage(page, { op: "unfilled-required" }));
+      return { requiresFileUpload: false, unfilledRequired: named.unfilledRequired || after.unfilledRequired };
     });
   }
 
@@ -231,6 +311,7 @@ export class StagehandBrowserSession implements BrowserSession {
         return;
       }
       const page = await this.page();
+      await this.applyNamedFill(page, namedFillPlan(variables, fields));
       await this.actOnDiscoveredFields(
         page,
         validationInstruction(fields),
@@ -241,21 +322,24 @@ export class StagehandBrowserSession implements BrowserSession {
 
   async locateSubmit(cached: CachedSelector | null): Promise<ObservedAction> {
     return this.guard(async () => {
-      if (cached) {
-        return {
-          instruction: SUBMIT_BUTTON_INSTRUCTION,
-          selector: cached.selector,
-          method: "click",
-        };
+      const page = await this.page();
+      const selector = await this.formPage(page, { op: "submit-selector" });
+      if (typeof selector === "string" && selector) {
+        return { instruction: SUBMIT_BUTTON_INSTRUCTION, selector, method: "click" };
       }
-      const action = await this.observeFirst(SUBMIT_BUTTON_INSTRUCTION, true);
-      return toObserved(action, SUBMIT_BUTTON_INSTRUCTION);
+      if (cached && !cached.selector.startsWith("xpath=") && !cached.selector.startsWith("/")) {
+        return { instruction: SUBMIT_BUTTON_INSTRUCTION, selector: cached.selector, method: "click" };
+      }
+      throw new StepFailure("SUBMIT", "Abschicken button not found", { name: "TimeoutError" });
     });
   }
 
   async fillMessage(text: string, cached: CachedSelector | null): Promise<ObservedAction> {
     return this.guard(async () => {
       const page = await this.page();
+      if ((await this.formPage(page, { op: "fill-message", text })) === true) {
+        return { instruction: MESSAGE_FIELD_INSTRUCTION, selector: "#message", method: "fill" };
+      }
       if (cached) {
         try {
           await page.locator(cached.selector).fill(text, { timeout: CACHED_SELECTOR_TIMEOUT_MS });
@@ -269,9 +353,7 @@ export class StagehandBrowserSession implements BrowserSession {
         await textarea.fill(text, { timeout: CACHED_SELECTOR_TIMEOUT_MS });
         return { instruction: MESSAGE_FIELD_INSTRUCTION, selector: "form textarea", method: "fill" };
       }
-      const action = await this.observeFirst(MESSAGE_FIELD_INSTRUCTION, true);
-      await page.locator(action.selector).fill(text, { timeout: CACHED_SELECTOR_TIMEOUT_MS });
-      return toObserved(action, MESSAGE_FIELD_INSTRUCTION);
+      throw new StepFailure("FILL_FORM", "message field not found", { name: "TimeoutError" });
     });
   }
 
@@ -289,6 +371,9 @@ export class StagehandBrowserSession implements BrowserSession {
   async submit(selector: string): Promise<SubmitCheck> {
     return this.guard(async () => {
       const page = await this.page();
+      if ((await this.formPage(page, { op: "click-submit" })) === true) {
+        return this.readSubmitResult(page);
+      }
       try {
         await page.locator(selector).click({ timeout: CACHED_SELECTOR_TIMEOUT_MS });
       } catch (error) {
@@ -349,12 +434,20 @@ export class StagehandBrowserSession implements BrowserSession {
   ): Promise<ObservedAction> {
     const page = await this.page();
     if (instruction === CONTACT_BUTTON_INSTRUCTION || cached?.selector === CONTACT_BUTTON_SELECTOR) {
-      for (let attempt = 0; attempt < 8; attempt += 1) {
+      for (let attempt = 0; attempt < 16; attempt += 1) {
         if (await clickCss(page, CONTACT_BUTTON_SELECTOR)) {
           return { instruction, selector: CONTACT_BUTTON_SELECTOR, method: "click" };
         }
         await page.waitForTimeout(500);
       }
+      const opened = await this.clickScoredOpener(page);
+      if (opened) {
+        return { instruction, selector: opened, method: "click" };
+      }
+      throw new StepFailure(step, "contact button not found", {
+        name: "TimeoutError",
+        domSnippet: await this.domSnippet(page),
+      });
     }
     if (cached) {
       try {
@@ -447,38 +540,34 @@ export class StagehandBrowserSession implements BrowserSession {
   }
 
   private async readSubmitResult(page: Page): Promise<SubmitCheck> {
-    let confirmed = false;
-    try {
-      await page.waitForFunction(
-        () => {
-          const text = document.body?.innerText ?? "";
-          return /Nachricht wurde gesendet|Nachricht gesendet|Anfrage wurde gesendet|erfolgreich gesendet|im Messenger/i.test(
-            text,
-          );
-        },
-        undefined,
-        { timeout: SUBMIT_CONFIRMATION_TIMEOUT_MS },
-      );
-      confirmed = true;
-    } catch {
-      confirmed = false;
+    const started = Date.now();
+    let text = "";
+    while (Date.now() - started < 8_000) {
+      text = await evaluateOnPage(page, () => document.body?.innerText ?? "");
+      if (textIndicatesSendCaptcha(text)) {
+        throw new CaptchaEncountered({ kind: "selector", detail: "sicherheitsabfrage" });
+      }
+      if (textIndicatesApplicationSent(text)) {
+        return { confirmed: true, bookmarked: null, validationErrors: [] };
+      }
+      await page.waitForTimeout(400);
     }
-    let bookmarked: boolean | null = null;
-    try {
-      bookmarked = (await page.locator('[aria-pressed="true"]').count({ timeout: 1000 })) > 0;
-    } catch {
-      bookmarked = null;
-    }
-    if (!confirmed && bookmarked) {
-      confirmed = true;
-    }
-    const validationErrors = await evaluateOnPage(page, () => {
+    const validationErrors = await this.validationErrors(page);
+    const composerStillOpen = (await this.formPage(page, { op: "has-message" })) === true;
+    return {
+      confirmed: !composerStillOpen && validationErrors.length === 0,
+      bookmarked: null,
+      validationErrors,
+    };
+  }
+
+  private async validationErrors(page: Page): Promise<string[]> {
+    return evaluateOnPage(page, () => {
       return Array.from(document.querySelectorAll('[aria-invalid="true"], [role="alert"], .error, .form-error'))
         .map((node) => node.textContent?.trim() ?? "")
         .filter((text) => text.length > 0)
         .slice(0, 8);
     });
-    return { confirmed, bookmarked, validationErrors };
   }
 
   private async looksLoggedIn(): Promise<boolean> {
@@ -511,17 +600,72 @@ export class StagehandBrowserSession implements BrowserSession {
     return action;
   }
 
-  private async formLocator(page: Page) {
-    const forms = page.locator("form");
-    const count = await forms.count({ timeout: 1000 }).catch(() => 0);
-    for (let index = 0; index < count; index += 1) {
-      const form = forms.nth(index);
-      const textareas = await form.locator("textarea").count({ timeout: 300 }).catch(() => 0);
-      if (textareas > 0) {
-        return form;
+  private async contactNameOn(page: Page): Promise<string | null> {
+    const result = await this.formPage(page, { op: "contact-candidates" });
+    if (!Array.isArray(result)) {
+      return null;
+    }
+    return selectContactName(result as ContactCandidate[]);
+  }
+
+  private async clickScoredOpener(page: Page): Promise<string | null> {
+    const result = await this.formPage(page, { op: "list-openers" });
+    if (!Array.isArray(result)) {
+      return null;
+    }
+    const candidates = result as OpenerCandidate[];
+    const index = pickOpenerIndex(candidates);
+    if (index < 0) {
+      return null;
+    }
+    const selector = await this.formPage(page, { op: "click-opener", index });
+    return typeof selector === "string" && selector ? selector : null;
+  }
+
+  private formPage(page: Page, command: FormPageCommand): Promise<FormPageResult> {
+    return evaluateWithArg(page, runFormPage, command);
+  }
+
+  private async applyNamedFill(page: Page, plan: NamedFillPlan): Promise<FormFillReport> {
+    const filled = asFillReport(await this.formPage(page, { op: "fill", plan }));
+    if (filled.needsPetWait) {
+      const started = Date.now();
+      while (Date.now() - started < 2500) {
+        const pets = asFillReport(await this.formPage(page, { op: "pets", plan }));
+        if (!pets.needsPetWait) {
+          break;
+        }
+        await page.waitForTimeout(200);
       }
     }
-    return null;
+    if (filled.needsMoveInHold) {
+      const started = Date.now();
+      let stable = 0;
+      while (Date.now() - started < 2000) {
+        const tick = asFillReport(await this.formPage(page, { op: "move-in", plan }));
+        if (tick.moveInStable) {
+          stable += 1;
+        } else {
+          stable = 0;
+        }
+        if (stable >= 3 && Date.now() - started >= 1000) {
+          break;
+        }
+        await page.waitForTimeout(200);
+      }
+    }
+    const afterWaits = asFillReport(await this.formPage(page, { op: "unfilled-required" }));
+    return { ...filled, unfilledRequired: afterWaits.unfilledRequired };
+  }
+
+  private async formLocator(page: Page) {
+    const index = await evaluateOnPage(page, () => {
+      return Array.from(document.forms).findIndex((form) => form.querySelector("textarea"));
+    });
+    if (index < 0) {
+      return null;
+    }
+    return page.locator("form").nth(index);
   }
 
   private async page(): Promise<Page> {
@@ -613,25 +757,56 @@ export class StagehandBrowserSession implements BrowserSession {
   }
 }
 
+function asFillReport(result: FormPageResult): FormFillReport {
+  if (
+    typeof result === "object" &&
+    result !== null &&
+    !Array.isArray(result) &&
+    "unfilledRequired" in result &&
+    "needsPetWait" in result &&
+    "needsMoveInHold" in result &&
+    "moveInStable" in result
+  ) {
+    return result;
+  }
+  throw new Error("Form fill did not report required fields");
+}
+
 function evaluateOnPage<R>(page: Page, fn: () => R): Promise<R> {
+  return evaluateWithArg(page, fn, undefined);
+}
+
+function evaluateWithArg<A, R>(page: Page, fn: (arg: A) => R | Promise<R>, arg: A): Promise<R> {
   // tsx keeps function names by calling a `__name` helper that does not exist in the page.
-  const expression = `(() => { const __name = (target) => target; return (${fn.toString()})(); })()`;
+  const payload = arg === undefined ? "" : JSON.stringify(arg);
+  const expression = `(() => { const __name = (target) => target; return (${fn.toString()})(${payload}); })()`;
   return page.evaluate(expression);
 }
 
 function clickCss(page: Page, selector: string): Promise<boolean> {
-  const expression = `(() => {
-    const nodes = Array.from(document.querySelectorAll(${JSON.stringify(selector)}));
-    const visible = nodes.find((node) => {
-      const rect = node.getBoundingClientRect();
-      const style = getComputedStyle(node);
-      return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) > 0 && rect.width >= 8 && rect.height >= 8;
-    });
-    if (!(visible instanceof HTMLElement)) return false;
-    visible.click();
-    return true;
-  })()`;
-  return page.evaluate(expression);
+  return clickCssAt(page, selector, 0);
+}
+
+function clickCssAt(page: Page, selector: string, index: number): Promise<boolean> {
+  return evaluateWithArg(
+    page,
+    (arg: { sel: string; index: number }) => {
+      const nodes = Array.from(document.querySelectorAll(arg.sel)).filter((node) => {
+        const rect = node.getBoundingClientRect();
+        const style = getComputedStyle(node);
+        return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) > 0 && rect.width >= 8 && rect.height >= 8;
+      });
+      nodes.sort((left, right) => left.getBoundingClientRect().top - right.getBoundingClientRect().top);
+      const target = nodes[arg.index];
+      if (!(target instanceof HTMLElement)) {
+        return false;
+      }
+      target.scrollIntoView({ block: "center" });
+      target.click();
+      return true;
+    },
+    { sel: selector, index },
+  );
 }
 
 let cdpRacesQuieted = false;

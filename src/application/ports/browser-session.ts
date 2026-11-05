@@ -34,6 +34,7 @@ export interface ObservedAction {
 
 export interface FillFieldsResult {
   requiresFileUpload: boolean;
+  unfilledRequired: boolean;
 }
 
 export interface SubmitCheck {
@@ -51,6 +52,7 @@ export interface BrowserSession {
   readTitle(): Promise<string>;
   extractCards(): Promise<CardRef[]>;
   extractExpose(): Promise<ExposeFacts>;
+  readContactName(): Promise<string | null>;
   openContact(cached: CachedSelector | null): Promise<ObservedAction>;
   fillRequiredFields(variables: FormData): Promise<FillFieldsResult>;
   fillFields(fields: readonly ProfileField[], variables: FormData): Promise<void>;

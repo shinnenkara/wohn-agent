@@ -33,17 +33,29 @@ export function sampleProfile(patch?: Partial<ApplicantProfile>): ApplicantProfi
   return {
     searchUrls: ["https://www.immobilienscout24.de/Suche/de/berlin/berlin/wohnung-mieten"],
     blacklistKeywords: ["tauschwohnung", "wohnungstausch", "nur tausch", "wbs erforderlich", "wbs-schein"],
-    messageTemplate: "Sehr geehrte(r) {{contact_name}}, Interesse an {{title}}. Tel +49 170 0000000",
+    messageTemplate: "Interesse an {{title}}. Tel +49 170 0000000",
     formData: {
       salutation: "Herr",
       firstName: "Max",
       lastName: "Mustermann",
+      email: "",
       phone: "+49 170 0000000",
-      moveInDate: "ab sofort / flexibel",
-      numberOfPersons: "1",
-      hasPets: "Nein",
-      employmentStatus: "Angestellt (unbefristet)",
-      monthlyNetIncome: "4200",
+      street: "",
+      houseNumber: "",
+      postcode: "",
+      city: "",
+      moveInDateType: "FROM_NOW",
+      moveInDate: "",
+      numberOfAdults: "1",
+      numberOfKids: "0",
+      hasPets: "FALSE",
+      petDetails: "",
+      employmentStatus: "INDEFINITE_PERIOD",
+      incomeAmount: "4200",
+      forCommercialPurposes: "FALSE",
+      rentArrears: "FALSE",
+      insolvencyProcess: "FALSE",
+      smoker: "FALSE",
       schufaAvailable: true,
       sendApplicationPackage: true,
     },
@@ -230,6 +242,8 @@ export class FakeBrowser implements BrowserSession {
   cards: CardRef[] = [];
   expose = sampleExpose();
   fileUpload = false;
+  unfilledRequired = false;
+  liveContactName: string | null = null;
   captchaQueue: Array<CaptchaSignal | null> = [];
   throwOnGoto: CaptchaSignal | null = null;
   sessionCaptcha: CaptchaSignal | null = null;
@@ -293,6 +307,10 @@ export class FakeBrowser implements BrowserSession {
     return this.expose;
   }
 
+  async readContactName(): Promise<string | null> {
+    return this.liveContactName;
+  }
+
   async openContact(cached: CachedSelector | null): Promise<ObservedAction> {
     this.openCalls += 1;
     void cached;
@@ -304,7 +322,7 @@ export class FakeBrowser implements BrowserSession {
   }
 
   async fillRequiredFields(): Promise<FillFieldsResult> {
-    return { requiresFileUpload: this.fileUpload };
+    return { requiresFileUpload: this.fileUpload, unfilledRequired: this.unfilledRequired };
   }
 
   async fillFields(fields: readonly ProfileField[]): Promise<void> {

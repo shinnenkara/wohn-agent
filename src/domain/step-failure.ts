@@ -15,3 +15,10 @@ export class StepFailure extends Error {
     this.name = options?.name ?? "StepFailure";
   }
 }
+
+export class ApplicationSent extends Error {
+  constructor() {
+    super("application sent");
+    this.name = "ApplicationSent";
+  }
+}

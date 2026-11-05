@@ -2,7 +2,7 @@
 
 Mermaid source in this file is the module map. When a use case, port, or adapter is added or removed, update the diagrams in the same change.
 
-The process never launches Chrome. It attaches to the debugging port, and only `compose` knows about Stagehand, SQLite, Gemini, and Telegram.
+The process never launches Chrome. It attaches to the debugging port, and only `compose` knows about Stagehand, SQLite, Gemini, and the notify service. That service is the Worker `wohn-notify`, outside this repo, at `https://wohn-notify.shinnenkara.workers.dev`. `compose` calls it over HTTP when `data/notify.json` exists.
 
 ```mermaid
 flowchart LR
@@ -12,7 +12,7 @@ flowchart LR
   chrome[Chrome_CDP]
   sqlite[(SQLite_file)]
   gemini[Gemini_API]
-  telegram[Telegram_Bot]
+  relay[Notify_relay]
   profile[applicant_profile_json]
 
   main --> compose
@@ -20,7 +20,7 @@ flowchart LR
   compose --> chrome
   compose --> sqlite
   compose --> gemini
-  compose --> telegram
+  compose --> relay
   compose --> profile
 ```
 
@@ -39,7 +39,7 @@ flowchart TB
     browser[stagehand_browser]
     rules[classify_by_rules]
     geminiClf[gemini_classifier]
-    telegramAd[telegram_notifier]
+    notifyAd[notify_notifiers]
     configAd[env_and_profile]
     clockAd[system_clock]
   end
@@ -65,7 +65,7 @@ flowchart TB
   composeNode --> sqliteRepos
   composeNode --> browser
   composeNode --> geminiClf
-  composeNode --> telegramAd
+  composeNode --> notifyAd
   composeNode --> configAd
   composeNode --> clockAd
   composeNode --> loggerImpl
@@ -88,7 +88,7 @@ flowchart TB
   browser -.-> ports
   geminiClf -.-> ports
   rules -.-> geminiClf
-  telegramAd -.-> ports
+  notifyAd -.-> ports
   clockAd -.-> ports
 ```
 

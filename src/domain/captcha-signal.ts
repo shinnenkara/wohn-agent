@@ -26,6 +26,21 @@ export function titleIsClearOfCaptcha(title: string): boolean {
   return title.trim().length > 0 && !titleIndicatesCaptcha(title);
 }
 
+export function textIndicatesSendCaptcha(text: string): boolean {
+  const normalized = text.toLowerCase();
+  return normalized.includes("sicherheitsabfrage") || normalized.includes("zeichen aus dem bild");
+}
+
+export function textIndicatesApplicationSent(text: string): boolean {
+  return /nachricht wurde gesendet|nachricht gesendet|anfrage wurde gesendet|erfolgreich gesendet|im messenger|abgeschickt|interesse bekundet/i.test(
+    text,
+  );
+}
+
+export function pausesSendingImmediately(signal: CaptchaSignal): boolean {
+  return signal.kind === "title" || signal.detail === "sicherheitsabfrage";
+}
+
 export interface CaptchaWidget {
   kind: "box" | "iframe";
   src: string;

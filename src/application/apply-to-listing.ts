@@ -9,7 +9,7 @@ import {
   type RecoveryCounts,
 } from "../domain/recovery-policy.js";
 import type { SelectorCacheEntry } from "../domain/selector-cache-entry.js";
-import { StepFailure } from "../domain/step-failure.js";
+import { ApplicationSent, StepFailure } from "../domain/step-failure.js";
 import { matchValidationFields } from "../domain/validation-fields.js";
 import { toFailureContext } from "./failure-context.js";
 import { notifySafely } from "./notify.js";
@@ -57,18 +57,19 @@ export async function applyToListing(
   }
   let current = listing.startApplying();
   deps.listings.save(current);
-  const message = renderMessage(profile.messageTemplate, current.salutation, current.title ?? "");
   const counts = emptyRecoveryCounts();
   // Locate the submit button before pasting the message so that observe()
   // snapshots do not include the rendered application text.
   let phase: Phase = "open";
   let submitSelector: string | null = null;
+  let message = "";
 
   for (let step = 0; step < MAX_STEPS; step += 1) {
     try {
       if (phase === "open") {
         const action = await deps.browser.openContact(cachedSelector(deps.selectors.get(CONTACT_KEY)));
         remember(deps, CONTACT_KEY, action);
+        counts.selectorRediscovers = 0;
         phase = "fields";
         continue;
       }
@@ -77,6 +78,10 @@ export async function applyToListing(
         if (filled.requiresFileUpload) {
           return finishManual(deps, current, "Required file upload", "FILE_UPLOAD");
         }
+        if (filled.unfilledRequired) {
+          return finishManual(deps, current, "Required fields are still empty", "VALIDATION_ERROR");
+        }
+        counts.selectorRediscovers = 0;
         phase = "locateSubmit";
         continue;
       }
@@ -84,12 +89,20 @@ export async function applyToListing(
         const action = await deps.browser.locateSubmit(cachedSelector(deps.selectors.get(SUBMIT_KEY)));
         remember(deps, SUBMIT_KEY, action);
         submitSelector = action.selector;
+        counts.selectorRediscovers = 0;
         phase = "message";
         continue;
       }
       if (phase === "message") {
+        const liveName = (await deps.browser.readContactName())?.trim() || null;
+        message = renderMessage(
+          profile.messageTemplate,
+          liveName ?? current.salutation,
+          current.title ?? "",
+        );
         const action = await deps.browser.fillMessage(message, cachedSelector(deps.selectors.get(MESSAGE_KEY)));
         remember(deps, MESSAGE_KEY, action);
+        counts.selectorRediscovers = 0;
         phase = "clickSubmit";
         continue;
       }
@@ -111,16 +124,11 @@ export async function applyToListing(
         }
         throw new StepFailure("SUBMIT", "Confirmation was not observed", { name: "ConfirmationTimeout" });
       }
-      current = current.markApplied(deps.clock.now());
-      deps.listings.save(current);
-      await notifySafely(deps.notifier, deps.logger, {
-        type: "APPLIED",
-        scoutId: current.scoutId,
-        title: current.title ?? current.scoutId,
-        url: current.url,
-      });
-      return { kind: "applied", listing: current };
+      return await finishApplied(deps, current);
     } catch (error) {
+      if (error instanceof ApplicationSent) {
+        return await finishApplied(deps, current);
+      }
       if (error instanceof CaptchaEncountered) {
         throw requeueForCaptcha(deps, current, error);
       }
@@ -195,7 +203,7 @@ async function heal(
     scoutId: input.current.scoutId,
     step: context.step,
     errorType: failure,
-    domSnippet: context.domSnippet.slice(0, 2000),
+    domSnippet: context.message.slice(0, 500),
     resolutionAction: decision.terminal ?? decision.actions.join("+"),
     createdAt: deps.clock.now(),
   });
@@ -257,6 +265,19 @@ async function heal(
   return { result: null, listing: released };
 }
 
+async function finishApplied(deps: ApplyDependencies, current: Listing): Promise<ApplyResult> {
+  const applied = current.status === "APPLYING" ? current.markApplied(deps.clock.now()) : current;
+  deps.listings.save(applied);
+  deps.logger.info("application sent", { scoutId: applied.scoutId, title: applied.title ?? applied.scoutId });
+  await notifySafely(deps.notifier, deps.logger, {
+    type: "APPLIED",
+    scoutId: applied.scoutId,
+    title: applied.title ?? applied.scoutId,
+    url: applied.url,
+  });
+  return { kind: "applied", listing: applied };
+}
+
 function finishFailed(deps: ApplyDependencies, current: Listing, errorCode: string): ApplyResult {
   const failed = current.status === "APPLYING" ? current.markFailed(errorCode) : current;
   deps.listings.save(failed);
@@ -281,6 +302,9 @@ async function finishManual(
 }
 
 function remember(deps: ApplyDependencies, actionKey: string, action: ObservedAction): void {
+  if (action.selector.startsWith("xpath=") || action.selector.startsWith("/")) {
+    return;
+  }
   const entry: SelectorCacheEntry = {
     actionKey,
     instruction: action.instruction,
