@@ -24,6 +24,7 @@ export interface StageRow {
 
 export interface ApartmentMail {
   id: string;
+  url: string;
   from: string;
   subject: string;
   sentAt: string;

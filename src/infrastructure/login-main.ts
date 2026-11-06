@@ -1,55 +1,111 @@
 import { spawn } from "node:child_process";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { pathToFileURL } from "node:url";
+import { z } from "zod";
 import { systemClock } from "../adapters/clock/system-clock.js";
-import { loadGoogleConfig } from "../adapters/config/google-env.js";
-import { startLoopback, randomOAuthState } from "../adapters/google/loopback.js";
-import { authorizationUrl, exchangeAuthCode } from "../adapters/google/oauth.js";
+import { loadGoogleConfig, SHARED_GOOGLE_URL } from "../adapters/config/google-env.js";
+import { GOOGLE_CREDENTIALS_PATH, googleEndpoint } from "../adapters/google/google-credentials.js";
 import { SqliteAccountStore } from "../adapters/sqlite/account-store.js";
 import { openDatabase } from "../adapters/sqlite/database.js";
 
-async function main(): Promise<void> {
-  const config = loadGoogleConfig();
-  const state = randomOAuthState();
-  const loop = await startLoopback(state);
-  const url = authorizationUrl({
-    clientId: config.clientId,
-    redirectUri: loop.redirectUri,
-    state,
-  });
-  openBrowser(url);
-  process.stdout.write("Waiting for Google login in the browser.\n");
-  try {
-    const code = await loop.code;
-    const token = await exchangeAuthCode(fetch, {
-      clientId: config.clientId,
-      clientSecret: config.clientSecret,
-      redirectUri: loop.redirectUri,
-      code,
-      now: systemClock.now(),
-    });
-    const profile = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/profile", {
-      headers: { authorization: `Bearer ${token.access_token}` },
-    });
-    if (!profile.ok) {
-      throw new Error("could not read the gmail address");
+const LINK_TIMEOUT_MS = 5 * 60 * 1000;
+const LINK_POLL_MS = 2_000;
+
+const CreatedDeviceSchema = z.strictObject({
+  deviceToken: z.string().min(1),
+  startUrl: z.string().min(1),
+});
+
+const SessionSchema = z.union([
+  z.strictObject({ linked: z.literal(false), email: z.null() }),
+  z.strictObject({ linked: z.literal(true), email: z.string().min(1) }),
+]);
+
+export interface LinkGoogleOptions {
+  googleUrl: string;
+  credentialsPath: string;
+  fetchImpl?: typeof fetch;
+  sleep?: (ms: number) => Promise<void>;
+  log?: (line: string) => void;
+  open?: (url: string) => void;
+  timeoutMs?: number;
+  pollMs?: number;
+  now?: () => number;
+  saveAccount: (email: string) => void;
+}
+
+export async function linkGoogle(options: LinkGoogleOptions): Promise<void> {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const sleep = options.sleep ?? delay;
+  const log = options.log ?? ((line: string) => process.stdout.write(line));
+  const open = options.open ?? openBrowser;
+  const timeoutMs = options.timeoutMs ?? LINK_TIMEOUT_MS;
+  const pollMs = options.pollMs ?? LINK_POLL_MS;
+  const now = options.now ?? Date.now;
+  const created = await createDevice(options.googleUrl, fetchImpl);
+  log(`Open this page and sign in with Google:\n${created.startUrl}\n`);
+  log("Waiting for Google...\n");
+  open(created.startUrl);
+  const started = now();
+  for (;;) {
+    const session = await readSession(options.googleUrl, created.deviceToken, fetchImpl);
+    if (session.linked) {
+      options.saveAccount(session.email);
+      mkdirSync(dirname(options.credentialsPath), { recursive: true });
+      writeFileSync(
+        options.credentialsPath,
+        `${JSON.stringify({ deviceToken: created.deviceToken }, null, 2)}\n`,
+        "utf8",
+      );
+      log(`Connected ${session.email}\n`);
+      return;
     }
-    const body = (await profile.json()) as { emailAddress?: string };
-    if (!body.emailAddress) {
-      throw new Error("gmail did not return an address");
+    if (now() - started >= timeoutMs) {
+      throw new Error("Timed out waiting for Google. Run npm run login again.");
     }
-    const db = openDatabase(config.databasePath);
-    try {
-      new SqliteAccountStore(db).saveLogin({
-        email: body.emailAddress,
-        tokenJson: JSON.stringify(token),
-        connectedAt: systemClock.now(),
-      });
-    } finally {
-      db.close();
-    }
-    process.stdout.write(`Connected ${body.emailAddress}\n`);
-  } finally {
-    await loop.close();
+    await sleep(pollMs);
   }
+}
+
+async function createDevice(
+  googleUrl: string,
+  fetchImpl: typeof fetch,
+): Promise<{ deviceToken: string; startUrl: string }> {
+  const response = await fetchImpl(googleEndpoint(googleUrl, "/v1/devices"), { method: "POST" });
+  if (!response.ok) {
+    throw new Error(`google login registration failed with ${response.status}`);
+  }
+  const parsed = CreatedDeviceSchema.safeParse(await response.json());
+  if (!parsed.success) {
+    throw new Error("google login registration returned an unexpected body");
+  }
+  return parsed.data;
+}
+
+async function readSession(
+  googleUrl: string,
+  deviceToken: string,
+  fetchImpl: typeof fetch,
+): Promise<{ linked: true; email: string } | { linked: false; email: null }> {
+  const response = await fetchImpl(googleEndpoint(googleUrl, "/v1/session"), {
+    headers: { authorization: `Bearer ${deviceToken}` },
+  });
+  if (response.status === 401) {
+    throw new Error("google login rejected the device token");
+  }
+  if (!response.ok) {
+    throw new Error(`google login session failed with ${response.status}`);
+  }
+  const parsed = SessionSchema.safeParse(await response.json());
+  if (!parsed.success) {
+    throw new Error("google login session returned an unexpected body");
+  }
+  return parsed.data;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function openBrowser(url: string): void {
@@ -62,8 +118,34 @@ function openBrowser(url: string): void {
   child.unref();
 }
 
-main().catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message}\n`);
-  process.exitCode = 1;
-});
+function invokedDirectly(): boolean {
+  const entry = process.argv[1];
+  if (!entry) {
+    return false;
+  }
+  return import.meta.url === pathToFileURL(entry).href;
+}
+
+async function main(): Promise<void> {
+  const config = loadGoogleConfig();
+  await linkGoogle({
+    googleUrl: SHARED_GOOGLE_URL,
+    credentialsPath: GOOGLE_CREDENTIALS_PATH,
+    saveAccount(email) {
+      const db = openDatabase(config.databasePath);
+      try {
+        new SqliteAccountStore(db).saveLogin({ email, connectedAt: systemClock.now() });
+      } finally {
+        db.close();
+      }
+    },
+  });
+}
+
+if (invokedDirectly()) {
+  main().catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message}\n`);
+    process.exitCode = 1;
+  });
+}

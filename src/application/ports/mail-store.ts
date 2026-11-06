@@ -40,6 +40,7 @@ export interface StoredVisit {
 
 export interface UnlinkedMail {
   id: string;
+  url: string;
   from: string;
   subject: string;
   sentAt: string;

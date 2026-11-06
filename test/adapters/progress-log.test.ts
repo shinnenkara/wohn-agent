@@ -7,6 +7,7 @@ import { openDatabase, openReadOnlyDatabase } from "../../src/adapters/sqlite/da
 import { SqliteListingRepository } from "../../src/adapters/sqlite/listing-repository.js";
 import { SqliteMailStore } from "../../src/adapters/sqlite/mail-store.js";
 import { SqliteProgressLog } from "../../src/adapters/sqlite/progress-log.js";
+import { gmailUrl } from "../../src/domain/gmail-url.js";
 import { discoverListing } from "../fakes.js";
 
 describe("sqlite progress", () => {
@@ -75,11 +76,31 @@ describe("sqlite progress", () => {
         },
         at,
       );
+      db.prepare(
+        "INSERT INTO google_account (id, email, token_json, connected_at) VALUES (1, 'a@example.com', '', ?)",
+      ).run(at.toISOString());
       const cards = progress.listApartments("applied");
       assert.equal(cards.length, 2);
       const card = cards.find((item) => item.scoutId === applied.scoutId);
       assert.equal(card?.opened, true);
       assert.equal(card?.mails[0]?.subject, "Neue Nachricht");
+      assert.equal(card?.mails[0]?.url, gmailUrl("m1", "a@example.com"));
+      const unlinked = new SqliteMailStore(db);
+      unlinked.insertMail(
+        {
+          gmailId: "m2",
+          threadId: "t2",
+          from: "scout@immobilienscout24.de",
+          subject: "Ohne Objekt",
+          sentAt: "2026-11-03T10:00:00.000Z",
+          text: "hello",
+          html: "",
+          kind: "unclassified",
+          scoutId: "",
+        },
+        at,
+      );
+      assert.equal(unlinked.listUnlinkedMail(20)[0]?.url, gmailUrl("m2", "a@example.com"));
       assert.equal(card?.viewings[0]?.place, "Badstr. 54");
     } finally {
       db.close();

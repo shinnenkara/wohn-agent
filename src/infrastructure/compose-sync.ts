@@ -1,7 +1,8 @@
-import type { GoogleConfig } from "../adapters/config/google-env.js";
+import { SHARED_GOOGLE_URL, type GoogleConfig } from "../adapters/config/google-env.js";
 import { systemClock } from "../adapters/clock/system-clock.js";
 import { createAuthorizer } from "../adapters/google/authorizer.js";
 import { CalendarAgenda } from "../adapters/google/calendar-client.js";
+import { GOOGLE_CREDENTIALS_PATH, loadGoogleCredentials } from "../adapters/google/google-credentials.js";
 import { GeminiMailReader } from "../adapters/google/gemini-reader.js";
 import { GmailMailbox } from "../adapters/google/gmail-client.js";
 import { SqliteAccountStore } from "../adapters/sqlite/account-store.js";
@@ -18,14 +19,17 @@ export interface SyncApplication {
 }
 
 export function composeSync(config: GoogleConfig): SyncApplication {
+  const credentials = loadGoogleCredentials(GOOGLE_CREDENTIALS_PATH);
+  if (!credentials) {
+    throw new Error("Google is not connected. Run npm run login.");
+  }
   const db = openDatabase(config.databasePath);
   const accounts = new SqliteAccountStore(db);
   const progress = new SqliteProgressLog(db);
   const backfilled = progress.backfillListings(systemClock.now());
   const authorizer = createAuthorizer({
-    accounts,
-    clientId: config.clientId,
-    clientSecret: config.clientSecret,
+    googleUrl: SHARED_GOOGLE_URL,
+    deviceToken: credentials.deviceToken,
     fetchImpl: fetch,
     now: () => systemClock.now(),
   });

@@ -7,6 +7,7 @@ import type {
   StageRow,
 } from "../../application/ports/progress-log.js";
 import { exposeUrl } from "../../domain/expose-url.js";
+import { gmailUrl } from "../../domain/gmail-url.js";
 import { isListingStatus } from "../../domain/listing-status.js";
 import {
   advance,
@@ -170,7 +171,7 @@ export class SqliteProgressLog implements ProgressLog {
       )
       .all(stage) as unknown as ApartmentSql[];
     const ids = rows.map((row) => row.scout_id);
-    const mails = this.mailsFor(ids);
+    const mails = this.mailsFor(ids, this.accountEmail());
     const viewings = this.viewingsFor(ids);
     return rows.map((row) => ({
       scoutId: row.scout_id,
@@ -193,7 +194,12 @@ export class SqliteProgressLog implements ProgressLog {
     }));
   }
 
-  private mailsFor(ids: readonly string[]) {
+  private accountEmail(): string | null {
+    const row = this.db.prepare("SELECT email FROM google_account WHERE id = 1").get() as { email: string } | undefined;
+    return row?.email ?? null;
+  }
+
+  private mailsFor(ids: readonly string[], email: string | null) {
     const grouped = new Map<string, ApartmentCard["mails"]>();
     if (ids.length === 0) {
       return grouped;
@@ -208,7 +214,13 @@ export class SqliteProgressLog implements ProgressLog {
       .all(...ids) as unknown as MailSql[];
     for (const row of rows) {
       const list = grouped.get(row.scout_id) ?? [];
-      list.push({ id: row.gmail_id, from: row.from_addr, subject: row.subject, sentAt: row.sent_at });
+      list.push({
+        id: row.gmail_id,
+        url: gmailUrl(row.gmail_id, email),
+        from: row.from_addr,
+        subject: row.subject,
+        sentAt: row.sent_at,
+      });
       grouped.set(row.scout_id, list);
     }
     return grouped;

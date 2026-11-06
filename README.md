@@ -43,6 +43,24 @@ Open the printed link in Telegram (the app or the web client) and press Start. T
 
 A different bot, or a different notify URL, is a later version. This prototype always uses `https://wohn-notify.shinnenkara.workers.dev`.
 
+## Gmail and Calendar
+
+Sync uses the shared Google login. You do not create a Cloud project or paste a client id. The login service is the Worker `wohn-google` at `https://wohn-google.shinnenkara.workers.dev`. Deploying that Worker is a one-time step in that repo.
+
+```powershell
+npm run login
+```
+
+Open the printed page and sign in with the Gmail account that receives ImmoScout mail. Allow read-only Gmail and Calendar. The command writes `data/google.json` and stores that address in the local database.
+
+Until Google verifies the application, that account has to be a test user on the shared app, and the login lasts about 7 days. When sync says the login expired, run `npm run login` again.
+
+```powershell
+npm run sync
+```
+
+`npm run sync` reads mail and calendar into the local database. Message bodies stay on this machine. The shared app only exchanges the login.
+
 ## Captcha and resume
 
 A page-level challenge, such as a title or heading `Ich bin kein Roboter`, or the AWS puzzle in `#captcha-container`, pauses on the first sight, writes the alert to the console, and sends it to Telegram when this machine is linked. It does not reload.

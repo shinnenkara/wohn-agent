@@ -4,7 +4,7 @@ Mermaid source in this file is the module map. When a use case, port, or adapter
 
 The apply process never launches Chrome. It attaches to the debugging port, and only `compose` knows about Stagehand, SQLite, Gemini, and the notify service. That service is the Worker `wohn-notify`, outside this repo, at `https://wohn-notify.shinnenkara.workers.dev`. `compose` calls it over HTTP when `data/notify.json` exists.
 
-Mail and calendar sync is a separate process. Only `compose-sync` knows about Gmail, Calendar, and the OAuth token. The progress page only reads SQLite. A later slice can add `MailSender` and `CalendarWriter` behind a confirmation step, with broader OAuth scopes and a new login. Those ports are not in this tree.
+Mail and calendar sync is a separate process. Only `compose-sync` knows about Gmail, Calendar, and the Google login Worker. That Worker is `wohn-google`, outside this repo, at `https://wohn-google.shinnenkara.workers.dev`. `compose-sync` asks it for an access token when `data/google.json` exists. The progress page only reads SQLite. A later slice can add `MailSender` and `CalendarWriter` behind a confirmation step, with broader OAuth scopes and a new login. Those ports are not in this tree.
 
 ```mermaid
 flowchart LR
@@ -19,6 +19,7 @@ flowchart LR
   gemini[Gemini_API]
   gmail[Gmail_readonly]
   calendar[Calendar_readonly]
+  googleLogin[Google_login]
   relay[Notify_relay]
   profile[applicant_profile_json]
 
@@ -33,6 +34,7 @@ flowchart LR
   composeSync --> sqlite
   composeSync --> gmail
   composeSync --> calendar
+  composeSync --> googleLogin
   composeSync --> gemini
   ui --> sqlite
 ```
@@ -52,7 +54,7 @@ flowchart TB
   subgraph adapters [Adapters]
     sqliteRepos[sqlite_listings_progress_mail]
     browser[stagehand_browser]
-    googleAd[gmail_calendar_oauth]
+    googleAd[gmail_calendar_clients]
     rules[classify_by_rules]
     geminiClf[gemini_classifier]
     notifyAd[notify_notifiers]
@@ -125,4 +127,4 @@ Use cases in [src/application](../src/application): `poll-search`, `inspect-list
 
 Domain rules stay in [src/domain](../src/domain): listing transitions, funnel stages, scout mail parsing, citation checks, message rendering, blacklist, validation-field matching, recovery policy, captcha breaker, active hours.
 
-Concrete edges stay in [src/adapters](../src/adapters) and are wired only by [src/infrastructure/compose.ts](../src/infrastructure/compose.ts) and [src/infrastructure/compose-sync.ts](../src/infrastructure/compose-sync.ts). The progress page is [src/infrastructure/ui-main.ts](../src/infrastructure/ui-main.ts).
+Concrete edges stay in [src/adapters](../src/adapters) and are wired only by [src/infrastructure/compose.ts](../src/infrastructure/compose.ts) and [src/infrastructure/compose-sync.ts](../src/infrastructure/compose-sync.ts). The progress page is [src/infrastructure/ui-main.ts](../src/infrastructure/ui-main.ts). The Google OAuth client lives on the `wohn-google` Worker. This repo keeps the Gmail and Calendar clients, and the device token in `data/google.json`.

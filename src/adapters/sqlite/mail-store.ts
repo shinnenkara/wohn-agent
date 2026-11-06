@@ -10,6 +10,7 @@ import type {
   UnreadMail,
 } from "../../application/ports/mail-store.js";
 import { visitFromPayload } from "../../application/ports/mail-store.js";
+import { gmailUrl } from "../../domain/gmail-url.js";
 
 interface MailRow {
   gmail_id: string;
@@ -165,8 +166,10 @@ export class SqliteMailStore implements MailStore {
          WHERE scout_id = '' ORDER BY sent_at DESC LIMIT ?`,
       )
       .all(limit) as unknown as Array<{ gmail_id: string; from_addr: string; subject: string; sent_at: string }>;
+    const email = accountEmail(this.db);
     return rows.map((row) => ({
       id: row.gmail_id,
+      url: gmailUrl(row.gmail_id, email),
       from: row.from_addr,
       subject: row.subject,
       sentAt: row.sent_at,
@@ -187,6 +190,11 @@ export class SqliteMailStore implements MailStore {
       place: row.place,
     }));
   }
+}
+
+function accountEmail(db: DatabaseSync): string | null {
+  const row = db.prepare("SELECT email FROM google_account WHERE id = 1").get() as { email: string } | undefined;
+  return row?.email ?? null;
 }
 
 function toEvent(row: EventRow): StoredEvent {

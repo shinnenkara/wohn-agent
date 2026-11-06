@@ -1,38 +1,71 @@
-import type { AccountStore } from "../../application/ports/account-store.js";
+import { z } from "zod";
+import { googleEndpoint } from "./google-credentials.js";
 import type { Authorizer } from "./authed-get.js";
-import { parseGoogleToken, refreshAccessToken, tokenExpired, type GoogleToken } from "./oauth.js";
+
+const NOT_CONNECTED = "Google is not connected. Run npm run login.";
+const LOGIN_EXPIRED = "Google login expired. Run npm run login.";
+
+const AccessTokenSchema = z.strictObject({
+  access_token: z.string().min(1),
+  expiry: z.string().min(1),
+});
 
 export function createAuthorizer(input: {
-  accounts: AccountStore;
-  clientId: string;
-  clientSecret: string;
+  googleUrl: string;
+  deviceToken: string;
   fetchImpl: typeof fetch;
   now(): Date;
 }): Authorizer {
+  let cached: { accessToken: string; expiry: string } | null = null;
   return {
     async accessToken(force?: boolean): Promise<string> {
-      const account = input.accounts.load();
-      if (!account) {
-        throw new Error("Google is not connected. Run npm run login.");
+      if (!force && cached && accessTokenCurrent(cached.expiry, input.now())) {
+        return cached.accessToken;
       }
-      let token = parseGoogleToken(account.tokenJson);
-      if (force || tokenExpired(token, input.now())) {
-        token = await refresh(input, token);
-        input.accounts.saveToken(JSON.stringify(token));
+      const url = new URL(googleEndpoint(input.googleUrl, "/v1/access-token"));
+      if (force) {
+        url.searchParams.set("force", "1");
       }
-      return token.access_token;
+      const response = await input.fetchImpl(url.toString(), {
+        headers: { authorization: `Bearer ${input.deviceToken}` },
+      });
+      if (response.status === 401) {
+        throw new Error(await loginError(response));
+      }
+      if (!response.ok) {
+        throw new Error(`google login failed with ${response.status}`);
+      }
+      const parsed = AccessTokenSchema.safeParse(await readJson(response));
+      if (!parsed.success) {
+        throw new Error("google login returned an unexpected body");
+      }
+      cached = { accessToken: parsed.data.access_token, expiry: parsed.data.expiry };
+      return cached.accessToken;
     },
   };
 }
 
-async function refresh(
-  input: { clientId: string; clientSecret: string; fetchImpl: typeof fetch; now(): Date },
-  token: GoogleToken,
-): Promise<GoogleToken> {
-  return refreshAccessToken(input.fetchImpl, {
-    clientId: input.clientId,
-    clientSecret: input.clientSecret,
-    refreshToken: token.refresh_token,
-    now: input.now(),
-  });
+function accessTokenCurrent(expiry: string, now: Date): boolean {
+  const time = new Date(expiry).getTime();
+  return !Number.isNaN(time) && time - now.getTime() >= 60_000;
+}
+
+async function readJson(response: Response): Promise<unknown> {
+  try {
+    return await response.json();
+  } catch {
+    return undefined;
+  }
+}
+
+async function loginError(response: Response): Promise<string> {
+  try {
+    const body = (await response.json()) as { error?: unknown };
+    if (body.error === LOGIN_EXPIRED || body.error === NOT_CONNECTED) {
+      return body.error;
+    }
+  } catch {
+    return NOT_CONNECTED;
+  }
+  return NOT_CONNECTED;
 }

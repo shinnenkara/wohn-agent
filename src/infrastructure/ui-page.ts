@@ -263,7 +263,7 @@ function drawUnlinked(data) {
   var list = document.getElementById("unlinked");
   var items = [];
   (data.mail || []).forEach(function (mail) {
-    items.push("<li>" + escapeHtml(mail.subject) + " <span class='muted'>" + escapeHtml(mail.from) + " · " + escapeHtml(mail.sentAt) + "</span></li>");
+    items.push(mailItem(mail));
   });
   (data.events || []).forEach(function (event) {
     items.push("<li>" + escapeHtml(event.title) + " <span class='muted'>" + escapeHtml(event.place || "") + " " + escapeHtml(event.start) + "</span></li>");
@@ -294,9 +294,7 @@ function renderCard(row) {
     row.floor ? "floor " + row.floor : "",
     row.moveIn ? "from " + row.moveIn : ""
   ].filter(Boolean).join(" · ");
-  var mails = (row.mails || []).map(function (mail) {
-    return "<li>" + escapeHtml(mail.subject) + " <span class='muted'>" + escapeHtml(mail.from) + " · " + escapeHtml(mail.sentAt) + "</span></li>";
-  }).join("");
+  var mails = (row.mails || []).map(mailItem).join("");
   var viewings = (row.viewings || []).map(function (event) {
     return "<li>" + escapeHtml(event.title || "Viewing") + " <span class='muted'>" + escapeHtml(event.place || "") + " " + escapeHtml(event.start) + "</span></li>";
   }).join("");
@@ -310,6 +308,10 @@ function renderCard(row) {
     (mails ? "<ul>" + mails + "</ul>" : "") +
     (viewings ? "<ul>" + viewings + "</ul>" : "") +
     "</article>";
+}
+
+function mailItem(mail) {
+  return "<li><a href='" + escapeHtml(mail.url) + "' target='_blank' rel='noreferrer'>" + escapeHtml(mail.subject) + "</a> <span class='muted'>" + escapeHtml(mail.from) + " · " + escapeHtml(mail.sentAt) + "</span></li>";
 }
 
 function trimNumber(value) {

@@ -84,12 +84,6 @@ function setup(): { deps: SyncDependencies; mailbox: FakeMailbox; agenda: FakeAg
   const accounts = new SqliteAccountStore(db);
   accounts.saveLogin({
     email: "a@example.com",
-    tokenJson: JSON.stringify({
-      access_token: "access",
-      refresh_token: "refresh",
-      expiry: "2026-11-05T00:00:00.000Z",
-      token_type: "Bearer",
-    }),
     connectedAt: clock.now(),
   });
   const mailbox = new FakeMailbox();
