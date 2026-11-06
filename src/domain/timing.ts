@@ -95,6 +95,10 @@ function addCalendarDays(parts: BerlinParts, days: number): BerlinParts {
   };
 }
 
+export function berlinInstant(parts: BerlinParts): Date {
+  return zonedDateTimeToUtc(parts);
+}
+
 function zonedDateTimeToUtc(parts: BerlinParts): Date {
   let utc = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second);
   for (let attempt = 0; attempt < 3; attempt += 1) {

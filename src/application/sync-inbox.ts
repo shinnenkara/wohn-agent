@@ -2,11 +2,26 @@ import type { AccountStore } from "./ports/account-store.js";
 import type { Agenda, AgendaEvent } from "./ports/agenda.js";
 import type { Clock } from "./ports/clock.js";
 import type { Mailbox, FetchedMail } from "./ports/mailbox.js";
-import type { MailStore } from "./ports/mail-store.js";
+import type { MailStore, UnreadMail } from "./ports/mail-store.js";
 import { MailReaderRateLimit, type MailReader } from "./ports/mail-reader.js";
+import type { Notifier } from "./ports/notifier.js";
 import type { ProgressLog } from "./ports/progress-log.js";
 import { scoutIdForEvent } from "../domain/event-link.js";
-import { validateCitation, type MailProposal } from "../domain/mail-citation.js";
+import { gmailUrl } from "../domain/gmail-url.js";
+import { emptyProposal, validateCitation, type MailProposal } from "../domain/mail-citation.js";
+import {
+  citedVisit,
+  classifyReply,
+  eveningSlots,
+  gmailComposeUrl,
+  mailboxAddress,
+  nextTopic,
+  renderDraft,
+  senderName,
+  settleReply,
+  type CitedSlot,
+  type MailClassification,
+} from "../domain/mail-reply.js";
 import type { FunnelStage } from "../domain/progress.js";
 import { calendarNotice, fromScout, parseScoutMail, type MailKind } from "../domain/scout-mail.js";
 
@@ -20,6 +35,7 @@ export interface SyncDependencies {
   mail: MailStore;
   progress: ProgressLog;
   reader: MailReader | null;
+  notifier: Notifier | null;
   clock: Clock;
   model: string;
 }
@@ -36,6 +52,7 @@ export interface SyncResult {
   mail: number;
   events: number;
   proposals: number;
+  drafts: number;
   waiting: number;
   advanced: number;
 }
@@ -45,7 +62,7 @@ export async function syncInbox(deps: SyncDependencies, options: SyncOptions): P
   if (!account) {
     throw new Error("Google is not connected. Run npm run login.");
   }
-  const result: SyncResult = { mail: 0, events: 0, proposals: 0, waiting: 0, advanced: 0 };
+  const result: SyncResult = { mail: 0, events: 0, proposals: 0, drafts: 0, waiting: 0, advanced: 0 };
   await syncMail(deps, account.gmailHistoryId, options, result);
   const fresh = deps.accounts.load();
   await syncEvents(deps, fresh?.calendarSyncToken ?? account.calendarSyncToken, options, result);
@@ -55,7 +72,7 @@ export async function syncInbox(deps: SyncDependencies, options: SyncOptions): P
 }
 
 export function formatSyncResult(result: SyncResult): string {
-  return `Stored ${result.mail} mail, ${result.events} events. Advanced ${result.advanced} apartments. Read ${result.proposals} proposals. ${result.waiting} mail still waiting.`;
+  return `Stored ${result.mail} mail, ${result.events} events. Advanced ${result.advanced} apartments. Read ${result.proposals} proposals. Wrote ${result.drafts} drafts. ${result.waiting} mail still waiting.`;
 }
 
 async function syncMail(
@@ -117,6 +134,8 @@ function ingestMail(deps: SyncDependencies, item: FetchedMail, result: SyncResul
       gmailId: item.id,
       threadId: item.threadId,
       from: item.from,
+      replyTo: item.replyTo,
+      messageId: item.messageId,
       subject: item.subject,
       sentAt: item.sentAt,
       text: item.text,
@@ -209,32 +228,37 @@ function ingestEvent(deps: SyncDependencies, event: AgendaEvent, result: SyncRes
 }
 
 async function readPending(deps: SyncDependencies, result: SyncResult): Promise<void> {
-  const pending = deps.mail.unclassifiedWithoutReading();
+  const pending = deps.mail.pendingWithoutReading();
   result.waiting = pending.length;
-  if (!deps.reader || pending.length === 0) {
-    return;
-  }
   let reads = 0;
   for (const item of pending) {
-    if (reads >= MAIL_READINGS_PER_RUN) {
-      break;
+    const body = item.text.trim() !== "" ? item.text : item.html;
+    const open = item.scoutId ? deps.mail.openTopic(item.scoutId) : null;
+    const ruled = classifyReply(item.subject, body, open);
+    if (ruled) {
+      await remember(
+        deps,
+        result,
+        item,
+        body,
+        ruled,
+        emptyProposal(),
+        ruled.intent === "viewing_confirm" ? citedVisit(body) : null,
+      );
+      continue;
+    }
+    if (!deps.reader || reads >= MAIL_READINGS_PER_RUN) {
+      continue;
     }
     if (reads > 0) {
       await deps.clock.sleep(MAIL_READING_GAP_MS);
     }
-    const body = item.text.trim() !== "" ? item.text : item.html;
     try {
       const raw = await deps.reader.propose(item.subject, body);
-      const checked = validateCitation(body, raw);
-      if (!checked.ok) {
-        deps.mail.insertReading(failedReading(deps, item.gmailId, "{}"));
-      } else {
-        deps.mail.insertReading(proposedReading(deps, item.gmailId, checked.proposal));
-        result.proposals += 1;
-        if (checked.proposal.visit && item.scoutId) {
-          advance(deps, result, item.scoutId, "viewing_offered", "mail", item.gmailId);
-        }
-      }
+      const checked = validateCitation(body, raw.proposal);
+      const classification = settleReply(open, raw.intent, raw.evidence, item.subject, body);
+      const visit = checked.proposal.visit ?? (classification.intent === "viewing_confirm" ? citedVisit(body) : null);
+      await remember(deps, result, item, body, classification, checked.proposal, visit);
     } catch (error) {
       if (error instanceof MailReaderRateLimit) {
         break;
@@ -244,7 +268,89 @@ async function readPending(deps: SyncDependencies, result: SyncResult): Promise<
     }
     reads += 1;
   }
-  result.waiting = deps.mail.unclassifiedWithoutReading().length;
+  result.waiting = deps.mail.pendingWithoutReading().length;
+}
+
+async function remember(
+  deps: SyncDependencies,
+  result: SyncResult,
+  item: UnreadMail,
+  body: string,
+  classification: MailClassification,
+  proposal: MailProposal,
+  visit: CitedSlot | null,
+): Promise<void> {
+  const storedVisit = visit
+    ? { when: visit.when, place: visit.place, citation: visit.citation }
+    : null;
+  const contactName = proposal.contact?.name || senderName(item.from);
+  const draft = renderDraft({
+    classification,
+    subject: item.subject,
+    body,
+    contactName,
+    slots: eveningSlots(deps.clock.now(), deps.mail.busyIntervals()),
+    visit: storedVisit,
+  });
+  deps.mail.insertDraft({
+    mailId: item.gmailId,
+    intent: classification.intent,
+    relation: classification.relation ?? "",
+    topic: classification.topic ?? "",
+    body: draft?.body ?? "",
+    altBody: draft?.altBody ?? "",
+    createdAt: deps.clock.now(),
+  });
+  deps.mail.insertReading(
+    proposedReading(deps, item.gmailId, {
+      ...proposal,
+      visit: storedVisit,
+      intent: classification.intent,
+      relation: classification.relation ?? "",
+      evidence: classification.evidence,
+    }),
+  );
+  const topic = nextTopic(item.scoutId ? deps.mail.openTopic(item.scoutId) : null, classification);
+  if (item.scoutId && topic && (classification.relation || classification.topic)) {
+    deps.mail.saveOpenTopic(item.scoutId, topic, deps.clock.now());
+  }
+  if (storedVisit && item.scoutId) {
+    advance(deps, result, item.scoutId, "viewing_offered", "mail", item.gmailId);
+  }
+  result.proposals += 1;
+  if (!draft?.body) {
+    return;
+  }
+  result.drafts += 1;
+  await notifyDraft(deps, item, classification.intent, draft.body, draft.altBody);
+}
+
+async function notifyDraft(
+  deps: SyncDependencies,
+  item: UnreadMail,
+  intent: string,
+  body: string,
+  altBody: string,
+): Promise<void> {
+  if (!deps.notifier) {
+    return;
+  }
+  const email = deps.accounts.load()?.email ?? null;
+  const to = mailboxAddress(item.replyTo, item.from);
+  try {
+    await deps.notifier.notify({
+      type: "MAIL_DRAFT",
+      scoutId: item.scoutId,
+      intent,
+      body,
+      altBody,
+      composeUrl: gmailComposeUrl({ account: email, to, subject: item.subject, body }),
+      altComposeUrl: altBody ? gmailComposeUrl({ account: email, to, subject: item.subject, body: altBody }) : "",
+      messageUrl: gmailUrl(item.gmailId, email),
+    });
+  } catch {
+    return;
+  }
 }
 
 function relinkEvents(deps: SyncDependencies, result: SyncResult): void {
@@ -279,7 +385,11 @@ function advance(
   }
 }
 
-function proposedReading(deps: SyncDependencies, mailId: string, proposal: MailProposal) {
+function proposedReading(
+  deps: SyncDependencies,
+  mailId: string,
+  proposal: MailProposal & { intent: string; relation: string; evidence: string },
+) {
   return {
     mailId,
     status: "proposed" as const,

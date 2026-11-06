@@ -28,6 +28,18 @@ export interface ApartmentMail {
   from: string;
   subject: string;
   sentAt: string;
+  intent: string;
+  relation: string;
+  draft: string;
+  altDraft: string;
+  composeUrl: string;
+  altComposeUrl: string;
+}
+
+export interface ApartmentTopic {
+  topic: string;
+  relation: string;
+  count: number;
 }
 
 export interface ApartmentViewing {
@@ -53,6 +65,9 @@ export interface ApartmentCard {
   floor: string | null;
   moveIn: string | null;
   description: string | null;
+  energyClass: string | null;
+  hasImage: boolean;
+  topic: ApartmentTopic | null;
   mails: ApartmentMail[];
   viewings: ApartmentViewing[];
 }

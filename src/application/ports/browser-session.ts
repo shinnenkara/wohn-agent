@@ -8,6 +8,14 @@ export interface SessionStatus {
 
 export interface CardRef {
   scoutId: string;
+  title?: string | null;
+  priceCold?: number | null;
+  priceWarm?: number | null;
+  rooms?: number | null;
+  areaSqm?: number | null;
+  energyClass?: string | null;
+  address?: string | null;
+  image?: Uint8Array | null;
 }
 
 export interface ExposeFacts {

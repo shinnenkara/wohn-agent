@@ -144,6 +144,31 @@ export class InMemoryListings implements ListingRepository {
     }
   }
 
+  fillMissing(listings: readonly Listing[]): void {
+    for (const incoming of listings) {
+      const current = this.rows.get(incoming.scoutId);
+      if (!current) {
+        continue;
+      }
+      const next = current.toData();
+      const patch = incoming.toData();
+      this.rows.set(
+        incoming.scoutId,
+        Listing.rehydrate({
+          ...next,
+          title: next.title ?? patch.title,
+          priceCold: next.priceCold ?? patch.priceCold,
+          priceWarm: next.priceWarm ?? patch.priceWarm,
+          rooms: next.rooms ?? patch.rooms,
+          areaSqm: next.areaSqm ?? patch.areaSqm,
+          address: next.address ?? patch.address,
+          energyClass: next.energyClass ?? patch.energyClass,
+          previewImage: next.previewImage ?? patch.previewImage,
+        }),
+      );
+    }
+  }
+
   save(listing: Listing): void {
     this.rows.set(listing.scoutId, listing);
   }
@@ -222,6 +247,9 @@ export class InMemoryProgress implements ProgressLog {
         floor: null,
         moveIn: null,
         description: null,
+        energyClass: null,
+        hasImage: false,
+        topic: null,
         mails: [],
         viewings: [],
       }));

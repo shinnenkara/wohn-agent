@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { TELEGRAM_OFF_MESSAGE, createNotifier } from "../../src/adapters/notify/create-notifier.js";
-import { CAPTCHA_ALERT_TEXT } from "../../src/adapters/notify/format-alert.js";
+import { CAPTCHA_ALERT_TEXT, formatAlert } from "../../src/adapters/notify/format-alert.js";
 import { linkNotify } from "../../src/infrastructure/link-notify.js";
 import { LoggingNotifier } from "../../src/adapters/notify/logging-notifier.js";
 import { loadNotifyCredentials } from "../../src/adapters/notify/notify-credentials.js";
@@ -16,6 +16,18 @@ describe("notify", () => {
     const lines: string[] = [];
     await new LoggingNotifier(logger(lines)).notify({ type: "CAPTCHA_OPEN" });
     assert.equal(lines[0], CAPTCHA_ALERT_TEXT);
+    const draft = formatAlert({
+      type: "MAIL_DRAFT",
+      scoutId: "171599833",
+      intent: "documents",
+      body: "Gerne.",
+      altBody: "",
+      composeUrl: "https://mail.google.com/mail/?view=cm",
+      altComposeUrl: "",
+      messageUrl: "https://mail.google.com/mail/u/0/#all/m1",
+    });
+    assert.equal(draft.includes("Open in Gmail: https://mail.google.com/mail/?view=cm"), true);
+    assert.equal(draft.includes("Message: https://mail.google.com/mail/u/0/#all/m1"), true);
   });
 
   it("posts linked alerts to the relay", async () => {

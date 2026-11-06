@@ -1,5 +1,12 @@
 import type { MailProposal } from "../../domain/mail-citation.js";
 
+export interface MailInterpretation {
+  proposal: MailProposal;
+  intent: string;
+  relation: string;
+  evidence: string;
+}
+
 export class MailReaderRateLimit extends Error {
   readonly retryAfterMs: number;
 
@@ -11,5 +18,5 @@ export class MailReaderRateLimit extends Error {
 }
 
 export interface MailReader {
-  propose(subject: string, body: string): Promise<MailProposal>;
+  propose(subject: string, body: string): Promise<MailInterpretation>;
 }

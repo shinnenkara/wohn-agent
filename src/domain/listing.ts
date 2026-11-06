@@ -34,6 +34,8 @@ export interface ListingData {
   moveIn: string | null;
   description: string | null;
   snapshot: string | null;
+  energyClass: string | null;
+  previewImage: Uint8Array | null;
   isPlusOnly: boolean;
   status: ListingStatus;
   filterReason: string | null;
@@ -55,7 +57,19 @@ const TRANSITIONS: Record<ListingStatus, readonly ListingStatus[]> = {
 export class Listing {
   private constructor(private readonly data: ListingData) {}
 
-  static discover(input: { scoutId: string; url: string; discoveredAt: Date }): Listing {
+  static discover(input: {
+    scoutId: string;
+    url: string;
+    discoveredAt: Date;
+    title?: string | null;
+    priceCold?: number | null;
+    priceWarm?: number | null;
+    rooms?: number | null;
+    areaSqm?: number | null;
+    address?: string | null;
+    energyClass?: string | null;
+    previewImage?: Uint8Array | null;
+  }): Listing {
     const scoutId = input.scoutId.trim();
     if (!scoutId) {
       throw new DomainError("scoutId is required");
@@ -63,19 +77,21 @@ export class Listing {
     return new Listing({
       scoutId,
       url: input.url,
-      title: null,
+      title: textOrNull(input.title, 300),
       salutation: null,
-      priceCold: null,
-      rooms: null,
-      areaSqm: null,
-      address: null,
-      priceWarm: null,
+      priceCold: amountOrNull(input.priceCold),
+      rooms: amountOrNull(input.rooms),
+      areaSqm: amountOrNull(input.areaSqm),
+      address: textOrNull(input.address, 200),
+      priceWarm: amountOrNull(input.priceWarm),
       extraCosts: null,
       deposit: null,
       floor: null,
       moveIn: null,
       description: null,
       snapshot: null,
+      energyClass: energyOrNull(input.energyClass),
+      previewImage: imageOrNull(input.previewImage),
       isPlusOnly: false,
       status: "DISCOVERED",
       filterReason: null,
@@ -153,6 +169,14 @@ export class Listing {
     return this.data.snapshot;
   }
 
+  get energyClass(): string | null {
+    return this.data.energyClass;
+  }
+
+  get previewImage(): Uint8Array | null {
+    return this.data.previewImage;
+  }
+
   get isPlusOnly(): boolean {
     return this.data.isPlusOnly;
   }
@@ -193,11 +217,11 @@ export class Listing {
       ...this.data,
       title: details.title,
       salutation: details.contactName,
-      priceCold: details.priceCold,
-      rooms: details.rooms,
-      areaSqm: details.areaSqm,
-      address: details.address ?? null,
-      priceWarm: details.priceWarm ?? null,
+      priceCold: details.priceCold ?? this.data.priceCold,
+      rooms: details.rooms ?? this.data.rooms,
+      areaSqm: details.areaSqm ?? this.data.areaSqm,
+      address: details.address ?? this.data.address,
+      priceWarm: details.priceWarm ?? this.data.priceWarm,
       extraCosts: details.extraCosts ?? null,
       deposit: details.deposit ?? null,
       floor: details.floor ?? null,
@@ -252,4 +276,28 @@ export class Listing {
     }
     return new Listing({ ...this.data, ...patch, status });
   }
+}
+
+function textOrNull(value: string | null | undefined, max: number): string | null {
+  const trimmed = value?.trim() ?? "";
+  return trimmed ? trimmed.slice(0, max) : null;
+}
+
+function amountOrNull(value: number | null | undefined): number | null {
+  if (value === null || value === undefined || !Number.isFinite(value) || value <= 0) {
+    return null;
+  }
+  return value;
+}
+
+function energyOrNull(value: string | null | undefined): string | null {
+  const trimmed = value?.trim().toUpperCase() ?? "";
+  return /^[A-H]\+?$/.test(trimmed) ? trimmed : null;
+}
+
+function imageOrNull(value: Uint8Array | null | undefined): Uint8Array | null {
+  if (!value || value.byteLength === 0) {
+    return null;
+  }
+  return new Uint8Array(value);
 }

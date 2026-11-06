@@ -73,9 +73,11 @@ export function progressPage(): string {
   .cards { display: grid; gap: 12px; max-width: 720px; }
   .card { border: 1px solid var(--border); background: var(--card); border-radius: 8px; padding: 12px 14px; }
   .card h3 { margin: 0 0 6px; font-size: 1rem; }
+  .card .preview { display: block; width: 100%; max-height: 180px; object-fit: cover; border-radius: 6px; margin: 0 0 8px; }
   .card p, .card ul { margin: 0 0 8px; }
   .muted, .card .muted { color: var(--muted); }
   a { color: var(--foreground); }
+  .draft { white-space: pre-wrap; margin: 4px 0; }
   @media (max-width: 700px) {
     .diagram { display: none; }
     .flow-table { position: static; width: auto; height: auto; margin: 0 0 16px; overflow: visible; clip: auto; }
@@ -292,26 +294,44 @@ function renderCard(row) {
     row.extraCosts ? trimNumber(row.extraCosts) + " extra" : "",
     row.deposit ? row.deposit + " deposit" : "",
     row.floor ? "floor " + row.floor : "",
-    row.moveIn ? "from " + row.moveIn : ""
+    row.moveIn ? "from " + row.moveIn : "",
+    row.energyClass ? "energy " + row.energyClass : ""
   ].filter(Boolean).join(" · ");
   var mails = (row.mails || []).map(mailItem).join("");
   var viewings = (row.viewings || []).map(function (event) {
     return "<li>" + escapeHtml(event.title || "Viewing") + " <span class='muted'>" + escapeHtml(event.place || "") + " " + escapeHtml(event.start) + "</span></li>";
   }).join("");
   return "<article class='card'>" +
+    (row.hasImage ? "<img class='preview' alt='' src='/api/apartments/image?id=" + encodeURIComponent(row.scoutId) + "'>" : "") +
     "<h3>" + escapeHtml(title) + "</h3>" +
     (row.address ? "<p>" + escapeHtml(row.address) + "</p>" : "") +
     (facts ? "<p>" + escapeHtml(facts) + "</p>" : "") +
     (row.description ? "<p class='muted'>" + escapeHtml(row.description) + "</p>" : "") +
     (row.opened ? "" : "<p class='muted'>The expose was not opened.</p>") +
+    topicLine(row.topic) +
     "<p><a href='" + escapeHtml(row.url) + "' target='_blank' rel='noreferrer'>See source</a></p>" +
     (mails ? "<ul>" + mails + "</ul>" : "") +
     (viewings ? "<ul>" + viewings + "</ul>" : "") +
     "</article>";
 }
 
+function topicLine(topic) {
+  if (!topic || !topic.topic) return "";
+  var names = { documents: "Documents", viewing: "Viewing", contract: "Contract", general: "General" };
+  var name = names[topic.topic] || topic.topic;
+  var state = topic.relation === "close" ? "finished" : "still on this step";
+  var count = Number(topic.count) || 0;
+  return "<p class='muted'>" + escapeHtml(name) + " · " + count + (count === 1 ? " mail · " : " mails · ") + state + "</p>";
+}
+
 function mailItem(mail) {
-  return "<li><a href='" + escapeHtml(mail.url) + "' target='_blank' rel='noreferrer'>" + escapeHtml(mail.subject) + "</a> <span class='muted'>" + escapeHtml(mail.from) + " · " + escapeHtml(mail.sentAt) + "</span></li>";
+  var tag = [mail.relation || "", mail.intent || ""].filter(Boolean).join(" · ");
+  var draft = mail.draft ? "<p class='draft'>" + escapeHtml(mail.draft) + "</p>" : "";
+  var alt = mail.altDraft ? "<p class='draft'>" + escapeHtml(mail.altDraft) + "</p>" : "";
+  var compose = mail.composeUrl ? "<p><a href='" + escapeHtml(mail.composeUrl) + "' target='_blank' rel='noreferrer'>Open reply in Gmail</a></p>" : "";
+  var other = mail.altComposeUrl ? "<p><a href='" + escapeHtml(mail.altComposeUrl) + "' target='_blank' rel='noreferrer'>Other reply in Gmail</a></p>" : "";
+  return "<li><a href='" + escapeHtml(mail.url) + "' target='_blank' rel='noreferrer'>" + escapeHtml(mail.subject) + "</a> <span class='muted'>" + escapeHtml(mail.from) + " · " + escapeHtml(mail.sentAt) + "</span>" +
+    (tag ? "<div class='muted'>" + escapeHtml(tag) + "</div>" : "") + draft + compose + alt + other + "</li>";
 }
 
 function trimNumber(value) {

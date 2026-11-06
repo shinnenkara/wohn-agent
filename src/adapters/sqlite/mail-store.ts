@@ -1,7 +1,9 @@
 import type { DatabaseSync } from "node:sqlite";
 import type {
+  BusyInterval,
   MailReading,
   MailStore,
+  StoredDraft,
   StoredEvent,
   StoredMail,
   StoredVisit,
@@ -9,17 +11,19 @@ import type {
   UnlinkedMail,
   UnreadMail,
 } from "../../application/ports/mail-store.js";
-import { visitFromPayload } from "../../application/ports/mail-store.js";
+import { storedTopic, visitFromPayload } from "../../application/ports/mail-store.js";
+import type { OpenTopic } from "../../domain/mail-reply.js";
 import { gmailUrl } from "../../domain/gmail-url.js";
 
 interface MailRow {
   gmail_id: string;
+  thread_id: string;
+  from_addr: string;
+  reply_to: string;
   subject: string;
   body_text: string;
   body_html: string;
   scout_id: string;
-  from_addr?: string;
-  sent_at?: string;
 }
 
 interface EventRow {
@@ -44,13 +48,15 @@ export class SqliteMailStore implements MailStore {
     const result = this.db
       .prepare(
         `INSERT OR IGNORE INTO mail (
-           gmail_id, thread_id, from_addr, subject, sent_at, body_text, body_html, kind, scout_id, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           gmail_id, thread_id, from_addr, reply_to, message_id, subject, sent_at, body_text, body_html, kind, scout_id, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         mail.gmailId,
         mail.threadId,
         mail.from,
+        mail.replyTo,
+        mail.messageId,
         mail.subject,
         mail.sentAt,
         mail.text,
@@ -76,22 +82,66 @@ export class SqliteMailStore implements MailStore {
     return row?.scout_id ?? null;
   }
 
-  unclassifiedWithoutReading(): UnreadMail[] {
+  pendingWithoutReading(): UnreadMail[] {
     const rows = this.db
       .prepare(
-        `SELECT gmail_id, subject, body_text, body_html, scout_id FROM mail
-         WHERE kind = 'unclassified'
+        `SELECT gmail_id, thread_id, from_addr, reply_to, subject, body_text, body_html, scout_id FROM mail
+         WHERE kind IN ('landlord', 'message_copy', 'unclassified')
            AND gmail_id NOT IN (SELECT mail_id FROM reading)
-         ORDER BY sent_at`,
+         ORDER BY CASE kind WHEN 'landlord' THEN 0 WHEN 'message_copy' THEN 1 ELSE 2 END, sent_at`,
       )
       .all() as unknown as MailRow[];
     return rows.map((row) => ({
       gmailId: row.gmail_id,
+      threadId: row.thread_id,
+      from: row.from_addr,
+      replyTo: row.reply_to,
       subject: row.subject,
       text: row.body_text,
       html: row.body_html,
       scoutId: row.scout_id,
     }));
+  }
+
+  insertDraft(draft: StoredDraft): void {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO reply_draft (mail_id, intent, relation, topic, body, alt_body, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        draft.mailId,
+        draft.intent,
+        draft.relation,
+        draft.topic,
+        draft.body,
+        draft.altBody,
+        draft.createdAt.toISOString(),
+      );
+  }
+
+  openTopic(scoutId: string): OpenTopic | null {
+    const row = this.db.prepare("SELECT topic, relation FROM open_topic WHERE scout_id = ?").get(scoutId) as
+      | { topic: string; relation: string }
+      | undefined;
+    return row ? storedTopic(row.topic, row.relation) : null;
+  }
+
+  saveOpenTopic(scoutId: string, topic: OpenTopic, at: Date): void {
+    this.db
+      .prepare(
+        `INSERT INTO open_topic (scout_id, topic, relation, updated_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(scout_id) DO UPDATE SET topic = excluded.topic, relation = excluded.relation, updated_at = excluded.updated_at`,
+      )
+      .run(scoutId, topic.topic, topic.relation, at.toISOString());
+  }
+
+  busyIntervals(): BusyInterval[] {
+    const rows = this.db.prepare("SELECT start_at, end_at FROM calendar_event").all() as unknown as Array<{
+      start_at: string;
+      end_at: string;
+    }>;
+    return rows.map((row) => ({ start: row.start_at, end: row.end_at }));
   }
 
   insertReading(reading: MailReading): void {

@@ -71,6 +71,21 @@ function route(
     sendJson(response, buildFlow(progress.listStages(), progress.listTransitions()));
     return;
   }
+  if (url.pathname === "/api/apartments/image") {
+    const id = url.searchParams.get("id") ?? "";
+    if (!/^\d{6,}$/.test(id)) {
+      send(response, 400, "text/plain; charset=utf-8", "Unknown apartment");
+      return;
+    }
+    const image = progress.readPreviewImage(id);
+    if (!image) {
+      send(response, 404, "text/plain; charset=utf-8", "No image");
+      return;
+    }
+    response.writeHead(200, { "content-type": "image/jpeg", "cache-control": "no-store" });
+    response.end(image);
+    return;
+  }
   if (url.pathname === "/api/apartments") {
     const stage = url.searchParams.get("stage") ?? "";
     if (!isFunnelStage(stage)) {

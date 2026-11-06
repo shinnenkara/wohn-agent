@@ -24,6 +24,49 @@ describe("poll and inspect", () => {
     assert.equal(harness.listings.findById("222222")?.url, "https://www.immobilienscout24.de/expose/222222");
   });
 
+  it("stores search-card facts and fills only missing fields later", async () => {
+    const harness = createHarness();
+    harness.browser.cards = [
+      {
+        scoutId: "222222",
+        title: "Großzügig wohnen: 3-Zimmer-Wohnung mit Terrasse",
+        priceCold: 1595,
+        rooms: 3,
+        areaSqm: 70.69,
+        energyClass: "A",
+        address: "Robert-Stolz-Str. 5, Mörsenbroich, Düsseldorf",
+      },
+    ];
+    const created = await pollSearch(harness.loop, harness.profile.searchUrls[0] ?? "");
+    assert.equal(created[0]?.title, "Großzügig wohnen: 3-Zimmer-Wohnung mit Terrasse");
+    assert.equal(created[0]?.priceCold, 1595);
+    assert.equal(harness.listings.findById("222222")?.energyClass, "A");
+
+    harness.listings.save(discoverListing("333333"));
+    harness.browser.cards = [{ scoutId: "333333", title: "Filled later", priceCold: 800 }];
+    await pollSearch(harness.loop, harness.profile.searchUrls[0] ?? "");
+    assert.equal(harness.listings.findById("333333")?.title, "Filled later");
+    assert.equal(harness.listings.findById("333333")?.priceCold, 800);
+
+    const exposed = discoverListing("444444").withDetails({
+      title: "Expose title",
+      contactName: null,
+      priceCold: 900,
+      rooms: 2,
+      areaSqm: 50,
+      address: "Expose Str. 1",
+      isPlusOnly: false,
+    });
+    harness.listings.save(exposed);
+    harness.browser.cards = [{ scoutId: "444444", title: "Search title", priceCold: 1, address: "Other Str. 9" }];
+    await pollSearch(harness.loop, harness.profile.searchUrls[0] ?? "");
+    const kept = harness.listings.findById("444444");
+    assert.equal(kept?.title, "Expose title");
+    assert.equal(kept?.priceCold, 900);
+    assert.equal(kept?.address, "Expose Str. 1");
+    assert.equal(kept?.status, "DISCOVERED");
+  });
+
   it("filters a blacklisted listing before opening the contact form", async () => {
     const harness = createHarness();
     harness.browser.expose = sampleExpose({ description: "Nur als Tauschwohnung abzugeben" });

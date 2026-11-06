@@ -1,6 +1,8 @@
 import type { DatabaseSync } from "node:sqlite";
 import type {
   ApartmentCard,
+  ApartmentMail,
+  ApartmentTopic,
   ProgressLog,
   ProgressNote,
   ProgressTransitionRow,
@@ -8,6 +10,7 @@ import type {
 } from "../../application/ports/progress-log.js";
 import { exposeUrl } from "../../domain/expose-url.js";
 import { gmailUrl } from "../../domain/gmail-url.js";
+import { gmailComposeUrl, mailboxAddress } from "../../domain/mail-reply.js";
 import { isListingStatus } from "../../domain/listing-status.js";
 import {
   advance,
@@ -40,7 +43,6 @@ interface ListingBackfillRow {
 interface ApartmentSql {
   scout_id: string;
   stage: string;
-  listing_id: string | null;
   title: string | null;
   url: string | null;
   address: string | null;
@@ -53,14 +55,22 @@ interface ApartmentSql {
   floor: string | null;
   move_in: string | null;
   description: string | null;
+  listing_status: string | null;
+  energy_class: string | null;
+  has_image: number | null;
 }
 
 interface MailSql {
   scout_id: string;
   gmail_id: string;
   from_addr: string;
+  reply_to: string;
   subject: string;
   sent_at: string;
+  intent: string;
+  relation: string;
+  body: string;
+  alt_body: string;
 }
 
 interface ViewingSql {
@@ -159,11 +169,15 @@ export class SqliteProgressLog implements ProgressLog {
   }
 
   listApartments(stage: FunnelStage): ApartmentCard[] {
+    const energy = this.columnExists("listings", "energy_class");
+    const image = this.columnExists("listings", "preview_image");
     const rows = this.db
       .prepare(
-        `SELECT p.scout_id, p.stage, l.scout_id AS listing_id, l.title, l.url, l.address,
+        `SELECT p.scout_id, p.stage, l.title, l.url, l.address,
                 l.price_cold, l.price_warm, l.extra_costs, l.deposit, l.rooms, l.area_sqm,
-                l.floor, l.move_in, l.description
+                l.floor, l.move_in, l.description, l.status AS listing_status,
+                ${energy ? "l.energy_class" : "NULL"} AS energy_class,
+                ${image ? "CASE WHEN l.preview_image IS NOT NULL THEN 1 ELSE 0 END" : "0"} AS has_image
          FROM progress p
          LEFT JOIN listings l ON l.scout_id = p.scout_id
          WHERE p.stage = ?
@@ -171,14 +185,16 @@ export class SqliteProgressLog implements ProgressLog {
       )
       .all(stage) as unknown as ApartmentSql[];
     const ids = rows.map((row) => row.scout_id);
-    const mails = this.mailsFor(ids, this.accountEmail());
+    const email = this.accountEmail();
+    const mails = this.mailsFor(ids, email);
+    const topics = this.topicsFor(ids);
     const viewings = this.viewingsFor(ids);
     return rows.map((row) => ({
       scoutId: row.scout_id,
       stage: assertFunnelStage(row.stage),
       title: row.title,
       url: row.url ?? exposeUrl(row.scout_id),
-      opened: row.listing_id !== null,
+      opened: row.listing_status !== null && isListingStatus(row.listing_status) && row.listing_status !== "DISCOVERED",
       address: row.address,
       priceCold: row.price_cold,
       priceWarm: row.price_warm,
@@ -189,9 +205,26 @@ export class SqliteProgressLog implements ProgressLog {
       floor: row.floor,
       moveIn: row.move_in,
       description: row.description,
+      energyClass: row.energy_class,
+      hasImage: Number(row.has_image) === 1,
+      topic: topics.get(row.scout_id) ?? null,
       mails: mails.get(row.scout_id) ?? [],
       viewings: viewings.get(row.scout_id) ?? [],
     }));
+  }
+
+  readPreviewImage(scoutId: string): Uint8Array | null {
+    if (!/^\d{6,}$/.test(scoutId) || !this.columnExists("listings", "preview_image")) {
+      return null;
+    }
+    const row = this.db.prepare("SELECT preview_image FROM listings WHERE scout_id = ?").get(scoutId) as
+      | { preview_image: Uint8Array | null }
+      | undefined;
+    const image = row?.preview_image;
+    if (!image || image.byteLength === 0) {
+      return null;
+    }
+    return new Uint8Array(image);
   }
 
   private accountEmail(): string | null {
@@ -200,30 +233,68 @@ export class SqliteProgressLog implements ProgressLog {
   }
 
   private mailsFor(ids: readonly string[], email: string | null) {
-    const grouped = new Map<string, ApartmentCard["mails"]>();
+    const grouped = new Map<string, ApartmentMail[]>();
     if (ids.length === 0) {
       return grouped;
     }
     const placeholders = ids.map(() => "?").join(", ");
+    const drafts = this.tableExists("reply_draft");
+    const replyTo = this.columnExists("mail", "reply_to");
     const rows = this.db
       .prepare(
-        `SELECT scout_id, gmail_id, from_addr, subject, sent_at FROM mail
-         WHERE scout_id IN (${placeholders})
-         ORDER BY sent_at DESC`,
+        `SELECT m.scout_id, m.gmail_id, m.from_addr, ${replyTo ? "m.reply_to" : "'' AS reply_to"}, m.subject, m.sent_at,
+                ${drafts ? "COALESCE(d.intent, '') AS intent, COALESCE(d.relation, '') AS relation, COALESCE(d.body, '') AS body, COALESCE(d.alt_body, '') AS alt_body" : "'' AS intent, '' AS relation, '' AS body, '' AS alt_body"}
+         FROM mail m
+         ${drafts ? "LEFT JOIN reply_draft d ON d.mail_id = m.gmail_id" : ""}
+         WHERE m.scout_id IN (${placeholders})
+         ORDER BY m.sent_at DESC`,
       )
       .all(...ids) as unknown as MailSql[];
     for (const row of rows) {
       const list = grouped.get(row.scout_id) ?? [];
-      list.push({
-        id: row.gmail_id,
-        url: gmailUrl(row.gmail_id, email),
-        from: row.from_addr,
-        subject: row.subject,
-        sentAt: row.sent_at,
-      });
+      list.push(toApartmentMail(row, email));
       grouped.set(row.scout_id, list);
     }
     return grouped;
+  }
+
+  private topicsFor(ids: readonly string[]) {
+    const grouped = new Map<string, ApartmentTopic>();
+    if (ids.length === 0 || !this.tableExists("open_topic") || !this.tableExists("reply_draft")) {
+      return grouped;
+    }
+    const placeholders = ids.map(() => "?").join(", ");
+    const topics = this.db
+      .prepare(`SELECT scout_id, topic, relation FROM open_topic WHERE scout_id IN (${placeholders})`)
+      .all(...ids) as unknown as Array<{ scout_id: string; topic: string; relation: string }>;
+    const counts = this.db
+      .prepare(
+        `SELECT m.scout_id, d.topic, COUNT(*) AS count
+         FROM reply_draft d
+         JOIN mail m ON m.gmail_id = d.mail_id
+         WHERE m.scout_id IN (${placeholders}) AND d.topic != ''
+         GROUP BY m.scout_id, d.topic`,
+      )
+      .all(...ids) as unknown as Array<{ scout_id: string; topic: string; count: number }>;
+    for (const topic of topics) {
+      const count = counts.find((row) => row.scout_id === topic.scout_id && row.topic === topic.topic);
+      grouped.set(topic.scout_id, {
+        topic: topic.topic,
+        relation: topic.relation,
+        count: Number(count?.count ?? 0),
+      });
+    }
+    return grouped;
+  }
+
+  private tableExists(name: string): boolean {
+    const row = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
+    return row !== undefined;
+  }
+
+  private columnExists(table: string, column: string): boolean {
+    const rows = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    return rows.some((row) => row.name === column);
   }
 
   private viewingsFor(ids: readonly string[]) {
@@ -299,6 +370,23 @@ export class SqliteProgressLog implements ProgressLog {
         input.at.toISOString(),
       );
   }
+}
+
+function toApartmentMail(row: MailSql, email: string | null): ApartmentMail {
+  const to = mailboxAddress(row.reply_to, row.from_addr);
+  return {
+    id: row.gmail_id,
+    url: gmailUrl(row.gmail_id, email),
+    from: row.from_addr,
+    subject: row.subject,
+    sentAt: row.sent_at,
+    intent: row.intent,
+    relation: row.relation,
+    draft: row.body,
+    altDraft: row.alt_body,
+    composeUrl: row.body ? gmailComposeUrl({ account: email, to, subject: row.subject, body: row.body }) : "",
+    altComposeUrl: row.alt_body ? gmailComposeUrl({ account: email, to, subject: row.subject, body: row.alt_body }) : "",
+  };
 }
 
 function assertSource(value: string): ProgressSource {

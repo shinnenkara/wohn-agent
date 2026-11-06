@@ -9,6 +9,7 @@ import {
 import { z } from "zod";
 import type {
   BrowserSession,
+  CardRef,
   CachedSelector,
   ExposeFacts,
   FillFieldsResult,
@@ -44,6 +45,7 @@ import { pickOpenerIndex, type OpenerCandidate } from "./contact-opener.js";
 import { runFormPage, type FormFillReport, type FormPageCommand, type FormPageResult } from "./form-page.js";
 import { namedFillPlan, type NamedFillPlan } from "./named-fields.js";
 import { interpretExpose, uniqueScoutIds, type RawExpose } from "./parse-listing-text.js";
+import { interpretSearchCard, readThumbnail } from "./parse-search-card.js";
 import { toStagehandVariables, validationInstruction, type StagehandVariable } from "./profile-variables.js";
 
 const HOME_URL = "https://www.immobilienscout24.de/";
@@ -184,20 +186,44 @@ export class StagehandBrowserSession implements BrowserSession {
     return this.guard(async () => (await this.page()).title());
   }
 
-  async extractCards(): Promise<Array<{ scoutId: string }>> {
+  async extractCards(): Promise<CardRef[]> {
     return this.guard(async () => {
       const page = await this.page();
-      const ids = await evaluateOnPage(page, () => {
-        const found: string[] = [];
-        document.querySelectorAll("article[data-obid], [data-obid], [data-id]").forEach((node) => {
-          const id = node.getAttribute("data-obid") ?? node.getAttribute("data-id");
-          if (id) {
-            found.push(id);
+      const raw = await evaluateOnPage(page, (): RawSearchCard[] => {
+        const found: RawSearchCard[] = [];
+        document.querySelectorAll("[data-obid], [data-id]").forEach((node) => {
+          const card = node as HTMLElement;
+          const id = card.getAttribute("data-obid") || card.getAttribute("data-id") || "";
+          const image = card.querySelector("img");
+          let imageUrl = "";
+          if (image) {
+            const current = image.currentSrc || "";
+            const src = image.getAttribute("src") || "";
+            const lazy = image.getAttribute("data-src") || "";
+            const srcset = (image.getAttribute("srcset") || "").split(",")[0] || "";
+            const fromSet = srcset.trim().split(/\s+/)[0] || "";
+            const candidate = [current, src, lazy, fromSet].find((item) => item && item.indexOf("data:") !== 0);
+            imageUrl = candidate || "";
           }
+          found.push({ scoutId: id, text: card.innerText || "", imageUrl });
         });
         return found;
       });
-      return uniqueScoutIds(ids).map((scoutId) => ({ scoutId }));
+      const first = new Map<string, RawSearchCard>();
+      for (const card of raw) {
+        if (!first.has(card.scoutId)) {
+          first.set(card.scoutId, card);
+        }
+      }
+      const ids = uniqueScoutIds([...first.keys()]);
+      return Promise.all(
+        ids.map(async (scoutId) => {
+          const card = first.get(scoutId);
+          const facts = interpretSearchCard(card?.text ?? "");
+          const image = await readThumbnail(card?.imageUrl ?? "");
+          return { scoutId, ...facts, image };
+        }),
+      );
     });
   }
 
@@ -771,6 +797,12 @@ function asFillReport(result: FormPageResult): FormFillReport {
     return result;
   }
   throw new Error("Form fill did not report required fields");
+}
+
+interface RawSearchCard {
+  scoutId: string;
+  text: string;
+  imageUrl: string;
 }
 
 function evaluateOnPage<R>(page: Page, fn: () => R): Promise<R> {

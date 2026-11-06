@@ -11,6 +11,8 @@ describe("gmail message", () => {
       payload: {
         headers: [
           { name: "From", value: "ImmoScout24 <myscout@immobilienscout24.de>" },
+          { name: "Reply-To", value: "Reply <back@example.com>" },
+          { name: "Message-ID", value: "<m1@example.com>" },
           { name: "Subject", value: "Anfrage versendet" },
         ],
         parts: [
@@ -22,6 +24,8 @@ describe("gmail message", () => {
     assert.equal(parsed.text, "Objekt 171599833");
     assert.equal(parsed.calendarPart, true);
     assert.equal(parsed.from.includes("myscout@"), true);
+    assert.equal(parsed.replyTo, "Reply <back@example.com>");
+    assert.equal(parsed.messageId, "<m1@example.com>");
     assert.equal(parsed.sentAt, new Date(1760000000000).toISOString());
   });
 });

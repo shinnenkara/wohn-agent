@@ -2,6 +2,8 @@ export interface FetchedMail {
   id: string;
   threadId: string;
   from: string;
+  replyTo: string;
+  messageId: string;
   subject: string;
   sentAt: string;
   text: string;

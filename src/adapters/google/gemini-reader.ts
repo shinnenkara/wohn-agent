@@ -1,6 +1,7 @@
 import { z } from "zod";
-import { MailReaderRateLimit, type MailReader } from "../../application/ports/mail-reader.js";
+import { MailReaderRateLimit, type MailInterpretation, type MailReader } from "../../application/ports/mail-reader.js";
 import { emptyProposal, type MailProposal } from "../../domain/mail-citation.js";
+import { MAIL_INTENTS, MAIL_RELATIONS } from "../../domain/mail-reply.js";
 
 const CitedSchema = z.object({
   text: z.string().optional(),
@@ -19,6 +20,9 @@ const ProposalSchema = z.object({
     role: z.string().optional(),
     citation: z.string().optional(),
   }).nullish(),
+  intent: z.string().optional(),
+  relation: z.string().optional(),
+  evidence: z.string().optional(),
 });
 
 export class GeminiMailReader implements MailReader {
@@ -28,7 +32,7 @@ export class GeminiMailReader implements MailReader {
     private readonly fetchImpl: typeof fetch,
   ) {}
 
-  async propose(subject: string, body: string): Promise<MailProposal> {
+  async propose(subject: string, body: string): Promise<MailInterpretation> {
     const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(this.model)}:generateContent`;
     const response = await this.fetchImpl(endpoint, {
       method: "POST",
@@ -57,8 +61,17 @@ export class GeminiMailReader implements MailReader {
     if (!text) {
       throw new Error("gemini returned no text");
     }
-    return toProposal(ProposalSchema.parse(JSON.parse(text)));
+    return toInterpretation(ProposalSchema.parse(JSON.parse(text)));
   }
+}
+
+function toInterpretation(parsed: z.infer<typeof ProposalSchema>): MailInterpretation {
+  return {
+    proposal: toProposal(parsed),
+    intent: parsed.intent ?? "",
+    relation: parsed.relation ?? "",
+    evidence: parsed.evidence ?? "",
+  };
 }
 
 function toProposal(parsed: z.infer<typeof ProposalSchema>): MailProposal {
@@ -85,8 +98,12 @@ function toProposal(parsed: z.infer<typeof ProposalSchema>): MailProposal {
 
 function prompt(subject: string, body: string): string {
   return (
-    "Extract apartment facts from this email. " +
-    "Every non-empty field must include a citation that is an exact substring of the email. " +
+    "Classify this landlord email about a Berlin apartment application and extract the apartment facts. " +
+    `intent is one of: ${MAIL_INTENTS.join(", ")}. ` +
+    `relation is one of: ${MAIL_RELATIONS.join(", ")}. ` +
+    "Use start when the mail opens that step, continue when it stays on the same step, and close when the step ends. " +
+    "evidence is an exact substring of the email that supports the intent, or empty when the intent is unknown. " +
+    "Every non-empty address, visit, and contact field must include a citation that is an exact substring of the email. " +
     "Leave a field empty when the email does not say it. " +
     "Never use Immobilien Scout's own office address.\n\nSubject: " +
     subject +
@@ -123,6 +140,9 @@ function schema(): Record<string, unknown> {
           citation: { type: "string" },
         },
       },
+      intent: { type: "string", enum: [...MAIL_INTENTS] },
+      relation: { type: "string", enum: [...MAIL_RELATIONS] },
+      evidence: { type: "string" },
     },
   };
 }

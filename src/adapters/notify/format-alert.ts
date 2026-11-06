@@ -13,5 +13,24 @@ export function formatAlert(alert: Alert): string {
       return `Applied to ${alert.title} (${alert.scoutId})\n${alert.url}`;
     case "MANUAL_REQUIRED":
       return `MANUAL_REQUIRED ${alert.scoutId}: ${alert.reason}\n${alert.url}`;
+    case "MAIL_DRAFT":
+      return formatDraft(alert);
   }
+}
+
+function formatDraft(alert: Extract<Alert, { type: "MAIL_DRAFT" }>): string {
+  const lines = [`Draft (${alert.intent}) for ${alert.scoutId}`, alert.body];
+  if (alert.composeUrl) {
+    lines.push(`Open in Gmail: ${alert.composeUrl}`);
+  }
+  if (alert.altBody) {
+    lines.push(alert.altBody);
+    if (alert.altComposeUrl) {
+      lines.push(`Other reply in Gmail: ${alert.altComposeUrl}`);
+    }
+  }
+  if (alert.messageUrl) {
+    lines.push(`Message: ${alert.messageUrl}`);
+  }
+  return lines.join("\n\n");
 }

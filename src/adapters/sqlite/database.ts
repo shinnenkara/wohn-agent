@@ -14,6 +14,7 @@ export function openDatabase(path: string): DatabaseSync {
   db.exec("PRAGMA busy_timeout = 5000");
   db.exec(loadSchemaSql());
   ensureListingColumns(db);
+  ensureMailColumns(db);
   return db;
 }
 
@@ -42,7 +43,27 @@ const LISTING_COLUMNS: ReadonlyArray<readonly [string, string]> = [
   ["move_in", "TEXT"],
   ["description", "TEXT"],
   ["snapshot", "TEXT"],
+  ["energy_class", "TEXT"],
+  ["preview_image", "BLOB"],
 ];
+
+const MAIL_COLUMNS: ReadonlyArray<readonly [string, string]> = [
+  ["message_id", "TEXT NOT NULL DEFAULT ''"],
+  ["reply_to", "TEXT NOT NULL DEFAULT ''"],
+];
+
+function ensureMailColumns(db: DatabaseSync): void {
+  const rows = db.prepare("PRAGMA table_info(mail)").all() as Array<{ name: string }>;
+  if (rows.length === 0) {
+    return;
+  }
+  const names = new Set(rows.map((row) => row.name));
+  for (const [name, type] of MAIL_COLUMNS) {
+    if (!names.has(name)) {
+      db.exec(`ALTER TABLE mail ADD COLUMN ${name} ${type}`);
+    }
+  }
+}
 
 function ensureListingColumns(db: DatabaseSync): void {
   const rows = db.prepare("PRAGMA table_info(listings)").all() as Array<{ name: string }>;

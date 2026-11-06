@@ -76,6 +76,55 @@ describe("listing status", () => {
       isPlusOnly: false,
     }), DomainError);
   });
+
+  it("keeps search-card facts when the expose omits them", () => {
+    const image = new Uint8Array([1, 2, 3]);
+    const preview = Listing.discover({
+      scoutId: "171728408",
+      url: "https://www.immobilienscout24.de/expose/171728408",
+      discoveredAt: new Date("2026-11-04T10:00:00.000Z"),
+      title: "Search title",
+      priceCold: 1595,
+      priceWarm: 1800,
+      rooms: 3,
+      areaSqm: 70.69,
+      address: "Robert-Stolz-Str. 5, Mörsenbroich, Düsseldorf",
+      energyClass: "A",
+      previewImage: image,
+    });
+    const opened = preview.withDetails({
+      title: "Expose title",
+      contactName: null,
+      priceCold: null,
+      priceWarm: null,
+      rooms: null,
+      areaSqm: null,
+      address: null,
+      isPlusOnly: false,
+    });
+    assert.equal(opened.title, "Expose title");
+    assert.equal(opened.priceCold, 1595);
+    assert.equal(opened.priceWarm, 1800);
+    assert.equal(opened.rooms, 3);
+    assert.equal(opened.areaSqm, 70.69);
+    assert.equal(opened.address, "Robert-Stolz-Str. 5, Mörsenbroich, Düsseldorf");
+    assert.equal(opened.energyClass, "A");
+    assert.deepEqual(opened.previewImage, image);
+    const replaced = preview.withDetails({
+      title: "Neu",
+      contactName: null,
+      priceCold: 800,
+      priceWarm: 900,
+      rooms: 2,
+      areaSqm: 40,
+      address: "Neue Str. 2",
+      isPlusOnly: false,
+    });
+    assert.equal(replaced.priceCold, 800);
+    assert.equal(replaced.rooms, 2);
+    assert.equal(replaced.areaSqm, 40);
+    assert.equal(replaced.address, "Neue Str. 2");
+  });
 });
 
 describe("message, blacklist, and validation", () => {

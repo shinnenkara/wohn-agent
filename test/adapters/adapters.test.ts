@@ -11,6 +11,7 @@ import { SqliteListingRepository } from "../../src/adapters/sqlite/listing-repos
 import { SqliteSelectorCache } from "../../src/adapters/sqlite/selector-cache-repository.js";
 import { classifyByRules } from "../../src/adapters/stagehand/classify-by-rules.js";
 import { interpretExpose, parseGermanAmount, uniqueScoutIds } from "../../src/adapters/stagehand/parse-listing-text.js";
+import { interpretSearchCard, readThumbnail, thumbnailUrl } from "../../src/adapters/stagehand/parse-search-card.js";
 import { isSubmitLabel, pickOpenerIndex } from "../../src/adapters/stagehand/contact-opener.js";
 import { namedFillPlan } from "../../src/adapters/stagehand/named-fields.js";
 import { toStagehandVariables, validationInstruction } from "../../src/adapters/stagehand/profile-variables.js";
@@ -25,6 +26,7 @@ import {
 } from "../../src/adapters/stagehand/rules-then-gemini-classifier.js";
 import { CAPTCHA_ALERT_TEXT, formatAlert } from "../../src/adapters/notify/format-alert.js";
 import type { FailureContext } from "../../src/application/ports/failure-classifier.js";
+import { Listing } from "../../src/domain/listing.js";
 import { discoverListing, sampleProfile } from "../fakes.js";
 
 const context = (patch: Partial<FailureContext>): FailureContext => ({
@@ -74,6 +76,51 @@ describe("sqlite repositories", () => {
         createdAt: new Date("2026-11-04T10:00:00.000Z"),
       });
       assert.equal(events.listAll()[0]?.errorType, "CAPTCHA_HIT");
+
+      const image = new Uint8Array([0xff, 0xd8, 0xff, 1]);
+      const preview = Listing.discover({
+        scoutId: "171728408",
+        url: "https://www.immobilienscout24.de/expose/171728408",
+        discoveredAt: new Date("2026-11-06T10:00:00.000Z"),
+        title: "Großzügig wohnen: 3-Zimmer-Wohnung mit Terrasse",
+        priceCold: 1595,
+        rooms: 3,
+        areaSqm: 70.69,
+        address: "Robert-Stolz-Str. 5, Mörsenbroich, Düsseldorf",
+        energyClass: "A",
+        previewImage: image,
+      });
+      listings.insertAll([preview]);
+      const stored = listings.findById(preview.scoutId);
+      assert.equal(stored?.energyClass, "A");
+      assert.equal(stored?.priceCold, 1595);
+      assert.deepEqual(stored?.previewImage, image);
+      const blank = discoverListing("171641158");
+      listings.insertAll([blank]);
+      listings.fillMissing([
+        Listing.discover({
+          scoutId: blank.scoutId,
+          url: blank.url,
+          discoveredAt: blank.discoveredAt,
+          title: "Later title",
+          priceCold: 900,
+          energyClass: "B",
+        }),
+      ]);
+      assert.equal(listings.findById(blank.scoutId)?.title, "Later title");
+      assert.equal(listings.findById(blank.scoutId)?.priceCold, 900);
+      assert.equal(listings.findById(blank.scoutId)?.status, "DISCOVERED");
+      listings.fillMissing([
+        Listing.discover({
+          scoutId: blank.scoutId,
+          url: blank.url,
+          discoveredAt: blank.discoveredAt,
+          title: "Should not replace",
+          priceCold: 1,
+        }),
+      ]);
+      assert.equal(listings.findById(blank.scoutId)?.title, "Later title");
+      assert.equal(listings.findById(blank.scoutId)?.priceCold, 900);
     } finally {
       db.close();
       rmSync(dir, { recursive: true, force: true });
@@ -147,6 +194,86 @@ describe("listing text, profile, and alerts", () => {
     assert.equal(facts.externalPortal, true);
     assert.equal(parseGermanAmount("850,50"), 850.5);
     assert.deepEqual(uniqueScoutIds(["12", "165686634", "165686634", "abc"]), ["165686634"]);
+  });
+
+  it("reads optional facts from a search card", async () => {
+    const card = interpretSearchCard(
+      [
+        "Projekteinheit",
+        "Großzügig wohnen: 3-Zimmer-Wohnung mit Terrasse",
+        "1.595 €",
+        "70,69 m²",
+        "3 Zi.",
+        "A",
+        "Robert-Stolz-Str. 5, Mörsenbroich, Düsseldorf",
+      ].join("\n"),
+    );
+    assert.equal(card.title, "Großzügig wohnen: 3-Zimmer-Wohnung mit Terrasse");
+    assert.equal(card.priceCold, 1595);
+    assert.equal(card.priceWarm, null);
+    assert.equal(card.areaSqm, 70.69);
+    assert.equal(card.rooms, 3);
+    assert.equal(card.energyClass, "A");
+    assert.equal(card.address, "Robert-Stolz-Str. 5, Mörsenbroich, Düsseldorf");
+
+    const warm = interpretSearchCard("Helle Wohnung\nWarmmiete 1.200 €");
+    assert.equal(warm.title, "Helle Wohnung");
+    assert.equal(warm.priceWarm, 1200);
+    assert.equal(warm.priceCold, null);
+
+    const sale = interpretSearchCard("Einfamilienhaus\nKaufpreis 450.000 €");
+    assert.equal(sale.title, "Einfamilienhaus");
+    assert.equal(sale.priceCold, null);
+    assert.equal(sale.priceWarm, null);
+
+    const labeled = interpretSearchCard("Altbau\nEnergieeffizienzklasse A+");
+    assert.equal(labeled.energyClass, "A+");
+    assert.deepEqual(interpretSearchCard("171728408"), {
+      title: null,
+      priceCold: null,
+      priceWarm: null,
+      rooms: null,
+      areaSqm: null,
+      energyClass: null,
+      address: null,
+    });
+
+    const source = "https://pictures.immobilienscout24.de/listings/abc/ORIG/resize/1106x830%3E/format/webp/quality/73/image.jpg";
+    const thumb = thumbnailUrl(source);
+    assert.ok(thumb);
+    const parsed = new URL(thumb);
+    assert.match(decodeURIComponent(parsed.pathname), /\/resize\/320x240>/);
+    assert.match(parsed.pathname, /\/format\/jpeg\//);
+    assert.match(parsed.pathname, /\/quality\/30\//);
+    assert.equal(thumbnailUrl("https://pictures.immobilienscout24.de/listings/abc/ORIG/image.jpg"), null);
+
+    const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0x00]);
+    const fetched = await readThumbnail(source, async () => new Response(jpeg, { headers: { "content-type": "image/jpeg" } }));
+    assert.deepEqual(fetched, jpeg);
+    const huge = new Uint8Array(48 * 1024 + 1);
+    assert.equal(
+      await readThumbnail(source, async () => new Response(huge, { headers: { "content-type": "image/jpeg" } })),
+      null,
+    );
+    assert.equal(
+      await readThumbnail(source, async () => new Response("nope", { headers: { "content-type": "text/html" } })),
+      null,
+    );
+    let called = false;
+    assert.equal(
+      await readThumbnail("https://pictures.immobilienscout24.de/listings/abc/ORIG/image.jpg", async () => {
+        called = true;
+        return new Response(jpeg);
+      }),
+      null,
+    );
+    assert.equal(called, false);
+    assert.equal(
+      await readThumbnail(source, async () => {
+        throw new Error("network");
+      }),
+      null,
+    );
   });
 
   it("keeps a labeled cold rent and ignores a year next to Zimmer", () => {

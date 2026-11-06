@@ -20,6 +20,8 @@ interface ListingRow {
   move_in: string | null;
   description: string | null;
   snapshot: string | null;
+  energy_class: string | null;
+  preview_image: Uint8Array | null;
   is_plus_only: number | null;
   status: string;
   filter_reason: string | null;
@@ -58,13 +60,53 @@ export class SqliteListingRepository implements ListingRepository {
       INSERT OR IGNORE INTO listings (
         scout_id, url, title, salutation, price_cold, rooms, area_sqm, address, price_warm,
         extra_costs, deposit, floor, move_in, description, snapshot, is_plus_only,
-        status, filter_reason, error_code, retry_count, discovered_at, applied_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        status, filter_reason, error_code, retry_count, discovered_at, applied_at,
+        energy_class, preview_image
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     this.db.exec("BEGIN");
     try {
       for (const listing of listings) {
         insert.run(...bindListing(listing.toData()));
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  fillMissing(listings: readonly Listing[]): void {
+    if (listings.length === 0) {
+      return;
+    }
+    const update = this.db.prepare(`
+      UPDATE listings SET
+        title = COALESCE(title, ?),
+        price_cold = COALESCE(price_cold, ?),
+        price_warm = COALESCE(price_warm, ?),
+        rooms = COALESCE(rooms, ?),
+        area_sqm = COALESCE(area_sqm, ?),
+        address = COALESCE(address, ?),
+        energy_class = COALESCE(energy_class, ?),
+        preview_image = COALESCE(preview_image, ?)
+      WHERE scout_id = ?
+    `);
+    this.db.exec("BEGIN");
+    try {
+      for (const listing of listings) {
+        const data = listing.toData();
+        update.run(
+          data.title,
+          data.priceCold,
+          data.priceWarm,
+          data.rooms,
+          data.areaSqm,
+          data.address,
+          data.energyClass,
+          data.previewImage,
+          data.scoutId,
+        );
       }
       this.db.exec("COMMIT");
     } catch (error) {
@@ -79,8 +121,9 @@ export class SqliteListingRepository implements ListingRepository {
         INSERT INTO listings (
           scout_id, url, title, salutation, price_cold, rooms, area_sqm, address, price_warm,
           extra_costs, deposit, floor, move_in, description, snapshot, is_plus_only,
-          status, filter_reason, error_code, retry_count, discovered_at, applied_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          status, filter_reason, error_code, retry_count, discovered_at, applied_at,
+          energy_class, preview_image
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(scout_id) DO UPDATE SET
           url = excluded.url,
           title = excluded.title,
@@ -102,7 +145,9 @@ export class SqliteListingRepository implements ListingRepository {
           error_code = excluded.error_code,
           retry_count = excluded.retry_count,
           discovered_at = excluded.discovered_at,
-          applied_at = excluded.applied_at
+          applied_at = excluded.applied_at,
+          energy_class = excluded.energy_class,
+          preview_image = excluded.preview_image
       `)
       .run(...bindListing(listing.toData()));
   }
@@ -124,7 +169,7 @@ export class SqliteListingRepository implements ListingRepository {
   }
 }
 
-function bindListing(data: ListingData): Array<string | number | null> {
+function bindListing(data: ListingData): Array<string | number | null | Uint8Array> {
   return [
     data.scoutId,
     data.url,
@@ -148,6 +193,8 @@ function bindListing(data: ListingData): Array<string | number | null> {
     data.retryCount,
     data.discoveredAt.toISOString(),
     data.appliedAt ? data.appliedAt.toISOString() : null,
+    data.energyClass,
+    data.previewImage,
   ];
 }
 
@@ -171,6 +218,8 @@ function toListing(row: ListingRow): Listing {
     moveIn: row.move_in,
     description: row.description,
     snapshot: row.snapshot,
+    energyClass: row.energy_class ?? null,
+    previewImage: imageFrom(row.preview_image),
     isPlusOnly: row.is_plus_only === 1,
     status: row.status,
     filterReason: row.filter_reason,
@@ -179,4 +228,11 @@ function toListing(row: ListingRow): Listing {
     discoveredAt: new Date(row.discovered_at),
     appliedAt: row.applied_at ? new Date(row.applied_at) : null,
   });
+}
+
+function imageFrom(value: Uint8Array | null | undefined): Uint8Array | null {
+  if (!value || value.byteLength === 0) {
+    return null;
+  }
+  return new Uint8Array(value);
 }

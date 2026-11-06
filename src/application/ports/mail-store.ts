@@ -1,10 +1,13 @@
 import type { MailKind } from "../../domain/scout-mail.js";
 import type { CitedVisit } from "../../domain/mail-citation.js";
+import { isMailRelation, isMailTopic, type OpenTopic } from "../../domain/mail-reply.js";
 
 export interface StoredMail {
   gmailId: string;
   threadId: string;
   from: string;
+  replyTo: string;
+  messageId: string;
   subject: string;
   sentAt: string;
   text: string;
@@ -25,10 +28,28 @@ export interface StoredEvent {
 
 export interface UnreadMail {
   gmailId: string;
+  threadId: string;
+  from: string;
+  replyTo: string;
   subject: string;
   text: string;
   html: string;
   scoutId: string;
+}
+
+export interface StoredDraft {
+  mailId: string;
+  intent: string;
+  relation: string;
+  topic: string;
+  body: string;
+  altBody: string;
+  createdAt: Date;
+}
+
+export interface BusyInterval {
+  start: string;
+  end: string;
 }
 
 export interface StoredVisit {
@@ -65,8 +86,12 @@ export interface MailStore {
   insertMail(mail: StoredMail, createdAt: Date): boolean;
   latestSentAt(): string | null;
   scoutIdForThread(threadId: string): string | null;
-  unclassifiedWithoutReading(): UnreadMail[];
+  pendingWithoutReading(): UnreadMail[];
   insertReading(reading: MailReading): void;
+  insertDraft(draft: StoredDraft): void;
+  openTopic(scoutId: string): OpenTopic | null;
+  saveOpenTopic(scoutId: string, topic: OpenTopic, at: Date): void;
+  busyIntervals(): BusyInterval[];
   insertEvent(event: StoredEvent, createdAt: Date): boolean;
   unlinkedEvents(): StoredEvent[];
   linkEvent(eventId: string, scoutId: string): void;
@@ -89,4 +114,11 @@ export function visitFromPayload(payload: string): CitedVisit | null {
   } catch {
     return null;
   }
+}
+
+export function storedTopic(topic: string, relation: string): OpenTopic | null {
+  if (!isMailTopic(topic) || !isMailRelation(relation)) {
+    return null;
+  }
+  return { topic, relation };
 }

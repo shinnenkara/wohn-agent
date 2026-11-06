@@ -5,6 +5,7 @@ export interface ListingRepository {
   findById(scoutId: string): Listing | null;
   findExistingIds(ids: readonly string[]): Set<string>;
   insertAll(listings: readonly Listing[]): void;
+  fillMissing(listings: readonly Listing[]): void;
   save(listing: Listing): void;
   listByStatus(status: ListingStatus): Listing[];
   resetApplyingToDiscovered(): number;
