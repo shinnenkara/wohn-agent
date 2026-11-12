@@ -10,6 +10,7 @@ import { isFunnelStage } from "../domain/progress.js";
 import { linkUnlinkedMail } from "./link-route.js";
 import { queueExposeRefresh } from "./refresh-route.js";
 import { repairStoredAddresses } from "./repair-addresses.js";
+import { repairStoredMailText } from "./repair-mail-text.js";
 import { progressPage } from "./ui-page.js";
 
 const PORT = 8787;
@@ -23,6 +24,7 @@ function main(): void {
     return;
   }
   correctStoredAddresses(databasePath);
+  correctStoredMail(databasePath);
   const db = openReadOnlyDatabase(databasePath);
   if (!hasProgressTable(db)) {
     db.close();
@@ -170,6 +172,19 @@ function correctStoredAddresses(databasePath: string): void {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     process.stderr.write(`Could not correct stored addresses: ${message}\n`);
+  }
+}
+
+function correctStoredMail(databasePath: string): void {
+  try {
+    const count = repairStoredMailText(databasePath);
+    if (count > 0) {
+      const label = count === 1 ? "message" : "messages";
+      process.stdout.write(`Corrected ${count} stored ${label}.\n`);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`Could not correct stored messages: ${message}\n`);
   }
 }
 

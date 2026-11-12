@@ -7,6 +7,7 @@ import { SqliteMailStore } from "../../src/adapters/sqlite/mail-store.js";
 import { SqliteProgressLog } from "../../src/adapters/sqlite/progress-log.js";
 import { syncHasNews, syncInbox, type SyncDependencies, type SyncOptions } from "../../src/application/sync-inbox.js";
 import { MailReaderRateLimit, type MailInterpretation, type MailReader } from "../../src/application/ports/mail-reader.js";
+import type { ProposedTriage } from "../../src/domain/triage.js";
 import type { Alert } from "../../src/application/ports/notifier.js";
 import type { Agenda, AgendaEvent, AgendaPage } from "../../src/application/ports/agenda.js";
 import type { FetchedMail, Mailbox } from "../../src/application/ports/mailbox.js";
@@ -384,7 +385,8 @@ describe("sync inbox", () => {
       assert.equal(deps.progress.stageOf("171599833"), "in_conversation");
       assert.equal(deps.mail.openTopic("171599833")?.topic, "documents");
       assert.equal(deps.mail.openTopic("171599833")?.relation, "continue");
-      assert.equal(alerts.length, 2);
+      assert.equal(alerts.length, 4);
+      assert.equal(alerts.filter((alert) => alert.type === "MAIL_TRIAGE").length, 2);
       const first = alerts[0];
       assert.equal(first?.type, "MAIL_DRAFT");
       if (first?.type === "MAIL_DRAFT") {
@@ -603,6 +605,335 @@ describe("sync inbox", () => {
       assert.deepEqual(seen, []);
       assert.equal(result.drafts, 0);
       assert.equal(result.proposals, 1);
+    } finally {
+      close();
+    }
+  });
+
+  it("stores two cited intents and still drafts the document request", async () => {
+    const { deps, mailbox, db, close } = setup();
+    openApplied(db, deps, "171599833", "Badstraße 54, 13357 Berlin", 900);
+    const alerts: Alert[] = [];
+    deps.notifier = { async notify(alert) { alerts.push(alert); } };
+    deps.reader = {
+      async propose() {
+        throw new Error("triage replaces the single intent reading");
+      },
+      async triage(): Promise<ProposedTriage> {
+        return {
+          intents: [
+            {
+              code: "PORTAL_INVITE_LINK",
+              confidence: 1,
+              summary: "Immomio invite",
+              citation: "https://portal.immomio.de/invite/abc",
+              deepLink: "https://portal.immomio.de/invite/abc",
+              linkCitation: "https://portal.immomio.de/invite/abc",
+              requestedDocuments: [],
+              proposedSlots: [],
+            },
+            {
+              code: "DOC_PACKAGE_REQ",
+              confidence: 1,
+              summary: "payslips",
+              citation: "Gehaltsnachweise",
+              deepLink: "",
+              linkCitation: "",
+              requestedDocuments: ["PAYSLIPS_3M"],
+              proposedSlots: [],
+            },
+          ],
+          redFlags: [],
+        };
+      },
+    };
+    try {
+      mailbox.listed = [
+        mail({
+          id: "bundle",
+          from: "Verwaltung <haus@example.com>",
+          subject: "Unterlagen",
+          text: "Objekt 171599833\nBitte senden Sie drei Gehaltsnachweise.\nhttps://portal.immomio.de/invite/abc",
+        }),
+      ];
+      const result = await syncInbox(deps, options({ updateCursors: false }));
+      const stored = deps.mail.loadTriage("bundle");
+      assert.equal(result.drafts, 1);
+      assert.equal(stored?.riskLevel, "SAFE");
+      assert.deepEqual(stored?.codes, ["DOC_PACKAGE_REQ", "PORTAL_INVITE_LINK"]);
+      assert.equal(alerts.some((alert) => alert.type === "MAIL_DRAFT"), true);
+      assert.equal(alerts.some((alert) => alert.type === "MAIL_TRIAGE"), false);
+      const card = deps.progress.listApartments("in_conversation").find((item) => item.scoutId === "171599833");
+      const shown = card?.mails.find((item) => item.id === "bundle");
+      assert.deepEqual(shown?.intents, ["DOC_PACKAGE_REQ", "PORTAL_INVITE_LINK"]);
+      assert.equal(shown?.linkHost, "portal.immomio.de");
+      assert.equal(shown?.linksAreText, false);
+      assert.equal(shown?.documents.includes("PAYSLIPS_3M"), true);
+    } finally {
+      close();
+    }
+  });
+
+  it("keeps the draft when a scam flag is not cited", async () => {
+    const { deps, mailbox, db, close } = setup();
+    openApplied(db, deps, "171599833", "Badstraße 54, 13357 Berlin", 900);
+    deps.reader = {
+      async propose() {
+        throw new Error("triage replaces the single intent reading");
+      },
+      async triage(): Promise<ProposedTriage> {
+        return {
+          intents: [
+            {
+              code: "DOC_PACKAGE_REQ",
+              confidence: 1,
+              summary: "payslips",
+              citation: "Gehaltsnachweise",
+              deepLink: "",
+              linkCitation: "",
+              requestedDocuments: ["PAYSLIPS_3M"],
+              proposedSlots: [{ text: "Montag 18 Uhr", citation: "not in the mail" }],
+            },
+          ],
+          redFlags: [{ code: "UPFRONT_PAYMENT_OR_FEE", citation: "wire the deposit now" }],
+        };
+      },
+    };
+    try {
+      mailbox.listed = [
+        mail({
+          id: "soft",
+          from: "Verwaltung <haus@example.com>",
+          subject: "Unterlagen",
+          text: "Objekt 171599833\nBitte senden Sie drei Gehaltsnachweise.",
+        }),
+      ];
+      const result = await syncInbox(deps, options({ updateCursors: false }));
+      assert.equal(result.drafts, 1);
+      assert.equal(deps.mail.loadTriage("soft")?.riskLevel, "SAFE");
+      assert.deepEqual(deps.mail.loadTriage("soft")?.flags, []);
+      assert.equal(deps.progress.stageOf("171599833"), "in_conversation");
+    } finally {
+      close();
+    }
+  });
+
+  it("skips the draft and the viewing advance on a cited upfront fee", async () => {
+    const { deps, mailbox, db, close } = setup();
+    openApplied(db, deps, "171599833", "Badstraße 54, 13357 Berlin", 900);
+    const alerts: Alert[] = [];
+    deps.notifier = { async notify(alert) { alerts.push(alert); } };
+    deps.reader = {
+      async propose() {
+        throw new Error("triage replaces the single intent reading");
+      },
+      async triage(): Promise<ProposedTriage> {
+        return {
+          intents: [
+            {
+              code: "APPT_CONFIRMATION",
+              confidence: 1,
+              summary: "viewing",
+              citation: "Besichtigung Badstr. 54 am 12. November 2026",
+              deepLink: "https://phish.example/pay",
+              linkCitation: "https://phish.example/pay",
+              requestedDocuments: [],
+              proposedSlots: [{ text: "12. November 2026", citation: "12. November 2026" }],
+            },
+          ],
+          redFlags: [{ code: "UPFRONT_PAYMENT_OR_FEE", citation: "500 €" }],
+        };
+      },
+    };
+    try {
+      mailbox.listed = [
+        mail({
+          id: "trap",
+          from: "Agent <agent@example.com>",
+          subject: "Besichtigung",
+          text: "Objekt 171599833\nBitte überweisen Sie 500 € vorab.\nBesichtigung Badstr. 54 am 12. November 2026\nhttps://phish.example/pay",
+        }),
+      ];
+      const result = await syncInbox(deps, options({ updateCursors: false }));
+      assert.equal(result.drafts, 0);
+      assert.equal(result.proposals, 1);
+      assert.equal(deps.progress.stageOf("171599833"), "in_conversation");
+      assert.equal(deps.mail.loadTriage("trap")?.riskLevel, "CRITICAL_SCAM_BLOCK");
+      assert.equal(alerts.length, 1);
+      assert.equal(alerts[0]?.type, "MAIL_TRIAGE");
+      const card = deps.progress.listApartments("in_conversation").find((item) => item.scoutId === "171599833");
+      const shown = card?.mails.find((item) => item.id === "trap");
+      assert.equal(shown?.linksAreText, true);
+      assert.equal(shown?.draft, "");
+    } finally {
+      close();
+    }
+  });
+
+  it("queues a portal invite and skips a receipt", async () => {
+    const { deps, mailbox, close } = setup();
+    const alerts: Alert[] = [];
+    deps.notifier = { async notify(alert) { alerts.push(alert); } };
+    deps.reader = {
+      async propose() {
+        throw new Error("triage replaces the single intent reading");
+      },
+      async triage(): Promise<ProposedTriage> {
+        return {
+          intents: [
+            {
+              code: "PORTAL_INVITE_LINK",
+              confidence: 1,
+              summary: "Immomio invite",
+              citation: "https://portal.immomio.de/invite/abc",
+              deepLink: "https://portal.immomio.de/invite/abc",
+              linkCitation: "https://portal.immomio.de/invite/abc",
+              requestedDocuments: [],
+              proposedSlots: [],
+            },
+          ],
+          redFlags: [],
+        };
+      },
+    };
+    try {
+      mailbox.listed = [
+        mail({
+          id: "ack",
+          from: "Haus <haus@example.com>",
+          subject: "Eingang",
+          sentAt: "2026-10-02T11:00:00.000Z",
+          text: "Wir haben Ihre Anfrage erhalten.",
+        }),
+        mail({
+          id: "portal",
+          from: "Portal <haus@example.com>",
+          subject: "Termin",
+          sentAt: "2026-10-02T12:00:00.000Z",
+          text: "Bitte buchen Sie https://portal.immomio.de/invite/abc",
+        }),
+      ];
+      await syncInbox(deps, options({ updateCursors: false }));
+      const actions = deps.mail.listActions();
+      assert.equal(actions.length, 1);
+      assert.equal(actions[0]?.actionCode, "OPEN_PORTAL");
+      assert.equal(actions[0]?.mailId, "portal");
+      assert.equal(actions[0]?.status, "NOTIFIED");
+      assert.equal(actions[0]?.actionUrl, "https://portal.immomio.de/invite/abc");
+      assert.equal(actions[0]?.deadlineAt, "2026-10-02T12:15:00.000Z");
+      const triage = alerts.find((alert) => alert.type === "MAIL_TRIAGE");
+      assert.equal(triage?.type === "MAIL_TRIAGE" ? triage.actionUrl : "", "https://portal.immomio.de/invite/abc");
+    } finally {
+      close();
+    }
+  });
+
+  it("leaves the portal pending when the alert fails", async () => {
+    const { deps, mailbox, close } = setup();
+    deps.notifier = {
+      async notify() {
+        throw new Error("down");
+      },
+    };
+    deps.reader = {
+      async propose() {
+        throw new Error("triage replaces the single intent reading");
+      },
+      async triage(): Promise<ProposedTriage> {
+        return {
+          intents: [
+            {
+              code: "PORTAL_INVITE_LINK",
+              confidence: 1,
+              summary: "Immomio invite",
+              citation: "https://portal.immomio.de/invite/abc",
+              deepLink: "https://portal.immomio.de/invite/abc",
+              linkCitation: "https://portal.immomio.de/invite/abc",
+              requestedDocuments: [],
+              proposedSlots: [],
+            },
+          ],
+          redFlags: [],
+        };
+      },
+    };
+    try {
+      mailbox.listed = [
+        mail({
+          id: "portal",
+          from: "Portal <haus@example.com>",
+          subject: "Termin",
+          text: "Bitte buchen Sie https://portal.immomio.de/invite/abc",
+        }),
+      ];
+      await syncInbox(deps, options({ updateCursors: false }));
+      assert.equal(deps.mail.listActions()[0]?.status, "PENDING");
+    } finally {
+      close();
+    }
+  });
+
+  it("supersedes a proposal when the appointment is confirmed and then rejected", async () => {
+    const { deps, mailbox, db, close } = setup();
+    openApplied(db, deps, "171599833", "Badstraße 54, 13357 Berlin", 900);
+    deps.notifier = { async notify() { return undefined; } };
+    deps.reader = {
+      async propose() {
+        throw new Error("triage replaces the single intent reading");
+      },
+      async triage(input): Promise<ProposedTriage> {
+        const code = input.subject === "Bestätigt" ? "APPT_CONFIRMATION" : "APPT_PROPOSAL";
+        return {
+          intents: [
+            {
+              code,
+              confidence: 1,
+              summary: code,
+              citation: "12. November 2026, 18:00 Uhr",
+              deepLink: "",
+              linkCitation: "",
+              requestedDocuments: [],
+              proposedSlots: [{ text: "12. November 2026, 18:00 Uhr", citation: "12. November 2026, 18:00 Uhr" }],
+            },
+          ],
+          redFlags: [],
+        };
+      },
+    };
+    try {
+      mailbox.listed = [
+        mail({
+          id: "proposal",
+          from: "Haus <haus@example.com>",
+          subject: "Terminvorschlag",
+          sentAt: "2026-11-12T10:00:00.000Z",
+          text: "Objekt 171599833\nKönnen Sie am 12. November 2026, 18:00 Uhr zur Besichtigung kommen?",
+        }),
+        mail({
+          id: "confirm",
+          from: "Haus <haus@example.com>",
+          subject: "Bestätigt",
+          sentAt: "2026-11-12T11:00:00.000Z",
+          text: "Objekt 171599833\nWir bestätigen die Besichtigung am 12. November 2026, 18:00 Uhr.",
+        }),
+        mail({
+          id: "reject",
+          from: "Haus <haus@example.com>",
+          subject: "Absage",
+          sentAt: "2026-11-12T12:00:00.000Z",
+          text: "Objekt 171599833\nDie Wohnung ist leider bereits vergeben.",
+        }),
+      ];
+      await syncInbox(deps, options({ updateCursors: false }));
+      const actions = deps.mail.listActions();
+      assert.deepEqual(
+        actions.map((action) => [action.mailId, action.actionCode, action.status]),
+        [
+          ["proposal", "ANSWER_PROPOSAL", "SUPERSEDED"],
+          ["confirm", "CONFIRM_APPT", "SUPERSEDED"],
+        ],
+      );
+      assert.equal(actions.some((action) => action.mailId === "reject"), false);
     } finally {
       close();
     }

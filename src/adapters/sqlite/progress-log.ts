@@ -333,10 +333,58 @@ export class SqliteProgressLog implements ProgressLog {
          ORDER BY m.sent_at DESC`,
       )
       .all(...ids) as unknown as MailSql[];
+    const triage = this.triageFor(rows.map((row) => row.gmail_id));
     for (const row of rows) {
       const list = grouped.get(row.scout_id) ?? [];
-      list.push(toApartmentMail(row, email));
+      list.push(toApartmentMail(row, email, triage.get(row.gmail_id)));
       grouped.set(row.scout_id, list);
+    }
+    return grouped;
+  }
+
+  private triageFor(mailIds: readonly string[]): Map<string, MailTriageView> {
+    const grouped = new Map<string, MailTriageView>();
+    if (mailIds.length === 0 || !this.tableExists("mail_extracted_intents") || !this.tableExists("mail_risk")) {
+      return grouped;
+    }
+    const placeholders = mailIds.map(() => "?").join(", ");
+    const intents = this.db
+      .prepare(
+        `SELECT mail_id, intent_code, metadata_json FROM mail_extracted_intents
+         WHERE mail_id IN (${placeholders})
+         ORDER BY intent_code`,
+      )
+      .all(...mailIds) as unknown as Array<{ mail_id: string; intent_code: string; metadata_json: string }>;
+    const risks = this.db
+      .prepare(
+        `SELECT mail_id, risk_level, red_flags_json FROM mail_risk WHERE mail_id IN (${placeholders})`,
+      )
+      .all(...mailIds) as unknown as Array<{ mail_id: string; risk_level: string; red_flags_json: string }>;
+    for (const row of intents) {
+      const view = grouped.get(row.mail_id) ?? emptyTriage();
+      view.intents.push(row.intent_code);
+      const metadata = parseMetadata(row.metadata_json);
+      for (const document of metadata.requestedDocuments) {
+        if (!view.documents.includes(document)) {
+          view.documents.push(document);
+        }
+      }
+      for (const slot of metadata.proposedSlots) {
+        if (slot.text && !view.slots.includes(slot.text)) {
+          view.slots.push(slot.text);
+        }
+      }
+      if (!view.linkUrl && metadata.actionDeepLink) {
+        view.linkUrl = metadata.actionDeepLink;
+        view.linkHost = hostOf(metadata.actionDeepLink);
+      }
+      grouped.set(row.mail_id, view);
+    }
+    for (const row of risks) {
+      const view = grouped.get(row.mail_id) ?? emptyTriage();
+      view.riskLevel = row.risk_level;
+      view.redFlags = parseStringList(row.red_flags_json);
+      grouped.set(row.mail_id, view);
     }
     return grouped;
   }
@@ -455,8 +503,31 @@ export class SqliteProgressLog implements ProgressLog {
   }
 }
 
-function toApartmentMail(row: MailSql, email: string | null): ApartmentMail {
+interface MailTriageView {
+  intents: string[];
+  riskLevel: string;
+  redFlags: string[];
+  documents: string[];
+  slots: string[];
+  linkUrl: string;
+  linkHost: string;
+}
+
+function emptyTriage(): MailTriageView {
+  return {
+    intents: [],
+    riskLevel: "",
+    redFlags: [],
+    documents: [],
+    slots: [],
+    linkUrl: "",
+    linkHost: "",
+  };
+}
+
+function toApartmentMail(row: MailSql, email: string | null, triage: MailTriageView | undefined): ApartmentMail {
   const to = mailboxAddress(row.reply_to, row.from_addr);
+  const view = triage ?? emptyTriage();
   return {
     id: row.gmail_id,
     url: gmailUrl(row.gmail_id, email),
@@ -470,7 +541,67 @@ function toApartmentMail(row: MailSql, email: string | null): ApartmentMail {
     composeUrl: row.body ? gmailComposeUrl({ account: email, to, subject: row.subject, body: row.body }) : "",
     altComposeUrl: row.alt_body ? gmailComposeUrl({ account: email, to, subject: row.subject, body: row.alt_body }) : "",
     cleanText: row.clean_text,
+    intents: view.intents,
+    riskLevel: view.riskLevel,
+    redFlags: view.redFlags,
+    documents: view.documents,
+    slots: view.slots,
+    linkUrl: view.linkUrl,
+    linkHost: view.linkHost,
+    linksAreText: view.riskLevel === "CRITICAL_SCAM_BLOCK",
   };
+}
+
+function parseMetadata(payload: string): {
+  actionDeepLink: string | null;
+  requestedDocuments: string[];
+  proposedSlots: Array<{ text: string }>;
+} {
+  try {
+    const parsed = JSON.parse(payload) as {
+      actionDeepLink?: unknown;
+      requestedDocuments?: unknown;
+      proposedSlots?: unknown;
+    };
+    const documents = Array.isArray(parsed.requestedDocuments)
+      ? parsed.requestedDocuments.filter((item): item is string => typeof item === "string")
+      : [];
+    const slots = Array.isArray(parsed.proposedSlots)
+      ? parsed.proposedSlots.flatMap((item) => {
+          if (!item || typeof item !== "object" || !("text" in item) || typeof item.text !== "string") {
+            return [];
+          }
+          return [{ text: item.text }];
+        })
+      : [];
+    return {
+      actionDeepLink: typeof parsed.actionDeepLink === "string" ? parsed.actionDeepLink : null,
+      requestedDocuments: documents,
+      proposedSlots: slots,
+    };
+  } catch {
+    return { actionDeepLink: null, requestedDocuments: [], proposedSlots: [] };
+  }
+}
+
+function parseStringList(payload: string): string[] {
+  try {
+    const parsed = JSON.parse(payload) as unknown;
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed.filter((item): item is string => typeof item === "string");
+  } catch {
+    return [];
+  }
+}
+
+function hostOf(value: string): string {
+  try {
+    return new URL(value).host;
+  } catch {
+    return "";
+  }
 }
 
 function assertSource(value: string): ProgressSource {

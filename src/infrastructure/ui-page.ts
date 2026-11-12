@@ -70,17 +70,28 @@ export function progressPage(): string {
   .tabs { display: flex; gap: 8px; margin: 8px 0 16px; }
   .tabs button { font: inherit; background: transparent; color: var(--foreground); border: 1px solid var(--border); padding: 6px 12px; cursor: pointer; border-radius: 6px; }
   .tabs button[aria-selected="true"] { background: var(--primary); color: var(--primary-foreground); border-color: var(--primary); }
-  .cards { display: grid; gap: 12px; max-width: 720px; }
-  .card { border: 1px solid var(--border); background: var(--card); border-radius: 8px; padding: 12px 14px; }
-  .card h3 { margin: 0 0 6px; font-size: 1rem; }
-  .card .preview { display: block; width: 100%; max-height: 180px; object-fit: cover; border-radius: 6px; margin: 0 0 8px; }
+  .cards { display: grid; gap: 16px; max-width: 36rem; }
+  .card { border: 1px solid var(--border); background: var(--card); border-radius: 8px; padding: 20px; min-width: 0; overflow-wrap: anywhere; }
+  .card h3 { margin: 0 0 4px; font-size: 1rem; }
+  .card .preview { display: block; width: 100%; max-height: 180px; object-fit: cover; border-radius: 6px; margin: 0 0 16px; }
+  .listing { margin-bottom: 16px; }
+  .card .listing p { margin: 0 0 4px; }
+  .card .listing p:last-child { margin-bottom: 0; }
+  .card .listing .facts { margin-top: 8px; }
   .card button, .link-mail button { font: inherit; background: transparent; color: var(--foreground); border: 1px solid var(--border); padding: 6px 12px; cursor: pointer; border-radius: 6px; }
-  .link-mail { display: flex; gap: 8px; align-items: center; margin: 6px 0 12px; flex-wrap: wrap; }
+  .link-mail { display: flex; gap: 8px; align-items: center; margin: 8px 0 16px; flex-wrap: wrap; }
   .link-mail input { font: inherit; background: var(--background); color: var(--foreground); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; }
   .card p, .card ul { margin: 0 0 8px; }
+  .card ul { margin-top: 16px; }
+  .card li + li { margin-top: 16px; }
+  .mail-body { margin: 8px 0; }
+  .mail-body summary { cursor: pointer; }
+  .card .message { white-space: pre-wrap; max-width: 65ch; margin: 8px 0 0; }
   .muted, .card .muted { color: var(--muted); }
   a { color: var(--foreground); }
   .draft { white-space: pre-wrap; margin: 4px 0; }
+  .chip { display: inline-block; border: 1px solid var(--border); border-radius: 999px; padding: 0 8px; margin: 0 4px 4px 0; font-size: 0.75rem; }
+  .banner { border: 1px solid var(--border); background: var(--accent); padding: 6px 8px; border-radius: 6px; }
   @media (max-width: 700px) {
     .diagram { display: none; }
     .flow-table { position: static; width: auto; height: auto; margin: 0 0 16px; overflow: visible; clip: auto; }
@@ -293,17 +304,24 @@ function showApartments(stage) {
 
 function renderCard(row) {
   var title = row.title || row.scoutId;
-  var facts = [
+  var primary = [
     row.rooms ? trimNumber(row.rooms) + " rooms" : "",
     row.areaSqm ? trimNumber(row.areaSqm) + " m²" : "",
-    row.priceCold ? trimNumber(row.priceCold) + " cold" : "",
-    row.priceWarm ? trimNumber(row.priceWarm) + " warm" : "",
-    row.extraCosts ? trimNumber(row.extraCosts) + " extra" : "",
-    row.deposit ? row.deposit + " deposit" : "",
+    row.priceCold ? trimNumber(row.priceCold) + " € cold" : "",
+    row.priceWarm ? trimNumber(row.priceWarm) + " € warm" : "",
+    row.extraCosts ? trimNumber(row.extraCosts) + " € extra" : ""
+  ].filter(Boolean).join(" · ");
+  var secondary = [
     row.floor ? "floor " + row.floor : "",
+    row.deposit ? row.deposit + " deposit" : "",
     row.moveIn ? "from " + row.moveIn : "",
     row.energyClass ? "energy " + row.energyClass : ""
-  ].filter(Boolean).join(" · ");
+  ].filter(Boolean);
+  var seen = seenSpan(row.discoveredAt);
+  var secondaryHtml = "";
+  if (secondary.length || seen) {
+    secondaryHtml = "<p class='muted'>" + escapeHtml(secondary.join(" · ")) + (secondary.length && seen ? " · " : "") + seen + "</p>";
+  }
   var empty = !row.title && !row.address && !row.priceCold && !row.priceWarm && !row.rooms && !row.areaSqm;
   var refresh = "";
   if (empty && row.refreshState === "queued") {
@@ -318,10 +336,12 @@ function renderCard(row) {
   }).join("");
   return "<article class='card'>" +
     (row.hasImage ? "<img class='preview' alt='' src='/api/apartments/image?id=" + encodeURIComponent(row.scoutId) + "'>" : "") +
+    "<div class='listing'>" +
     "<h3>" + escapeHtml(title) + "</h3>" +
-    seenLine(row.discoveredAt) +
     (row.address ? "<p>" + escapeHtml(row.address) + "</p>" : "") +
-    (facts ? "<p>" + escapeHtml(facts) + "</p>" : "") +
+    (primary ? "<p class='facts'>" + escapeHtml(primary) + "</p>" : "") +
+    secondaryHtml +
+    "</div>" +
     (row.description ? "<p class='muted'>" + escapeHtml(row.description) + "</p>" : "") +
     (row.opened ? "" : "<p class='muted'>The expose was not opened.</p>") +
     refresh +
@@ -360,14 +380,29 @@ function topicLine(topic) {
 
 function mailItem(mail, linkable) {
   var tag = [mail.relation || "", mail.intent || ""].filter(Boolean).join(" · ");
-  var clean = !linkable && mail.cleanText ? "<p>" + escapeHtml(mail.cleanText) + "</p>" : "";
+  var chips = (mail.intents || []).map(function (code) {
+    return "<span class='chip'>" + escapeHtml(code) + "</span>";
+  }).join("");
+  var flags = (mail.redFlags || []).join(", ");
+  var bannerText = mail.riskLevel && mail.riskLevel !== "SAFE" ? mail.riskLevel + (flags ? ": " + flags : "") : flags;
+  var banner = bannerText ? "<p class='banner'>" + escapeHtml(bannerText) + "</p>" : "";
+  var docs = (mail.documents || []).length ? "<p class='muted'>" + escapeHtml(mail.documents.join(", ")) + "</p>" : "";
+  var slots = (mail.slots || []).length ? "<p class='muted'>" + escapeHtml(mail.slots.join("; ")) + "</p>" : "";
+  var portal = "";
+  if (mail.linkUrl) {
+    portal = mail.linksAreText
+      ? "<p>" + escapeHtml(mail.linkUrl) + "</p>"
+      : "<p><a href='" + escapeHtml(mail.linkUrl) + "' target='_blank' rel='noreferrer'>" + escapeHtml(mail.linkHost || mail.linkUrl) + "</a></p>";
+  }
+  var clean = !linkable && mail.cleanText ? "<details class='mail-body'><summary>Show message</summary><p class='message'>" + escapeHtml(mail.cleanText) + "</p></details>" : "";
   var draft = mail.draft ? "<p class='draft'>" + escapeHtml(mail.draft) + "</p>" : "";
   var alt = mail.altDraft ? "<p class='draft'>" + escapeHtml(mail.altDraft) + "</p>" : "";
   var compose = mail.composeUrl ? "<p><a href='" + escapeHtml(mail.composeUrl) + "' target='_blank' rel='noreferrer'>Open reply in Gmail</a></p>" : "";
   var other = mail.altComposeUrl ? "<p><a href='" + escapeHtml(mail.altComposeUrl) + "' target='_blank' rel='noreferrer'>Other reply in Gmail</a></p>" : "";
   var form = linkable ? "<form class='link-mail' data-id='" + escapeHtml(mail.id) + "'><input name='scoutId' placeholder='Scout id' aria-label='Scout id'><button type='submit'>Link</button></form>" : "";
   return "<li><a href='" + escapeHtml(mail.url) + "' target='_blank' rel='noreferrer'>" + escapeHtml(mail.subject) + "</a> <span class='muted'>" + escapeHtml(mail.from) + " · " + escapeHtml(mail.sentAt) + "</span>" +
-    (tag ? "<div class='muted'>" + escapeHtml(tag) + "</div>" : "") + clean + draft + compose + alt + other + form + "</li>";
+    (tag ? "<div class='muted'>" + escapeHtml(tag) + "</div>" : "") +
+    (chips ? "<div>" + chips + "</div>" : "") + banner + docs + slots + portal + clean + draft + compose + alt + other + form + "</li>";
 }
 
 function linkMail(event) {
@@ -399,7 +434,7 @@ function linkMail(event) {
   });
 }
 
-function seenLine(iso) {
+function seenSpan(iso) {
   if (!iso) return "";
   var date = new Date(iso);
   if (isNaN(date.getTime())) return "";
@@ -413,7 +448,7 @@ function seenLine(iso) {
     label += ", " + time;
   }
   var full = date.toLocaleString("de-DE", { timeZone: "Europe/Berlin" });
-  return "<p class='muted' title='" + escapeHtml(full) + "'>Seen " + escapeHtml(label) + "</p>";
+  return "<span title='" + escapeHtml(full) + "'>Seen " + escapeHtml(label) + "</span>";
 }
 
 function berlinClock(date) {

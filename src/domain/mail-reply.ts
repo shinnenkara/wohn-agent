@@ -540,10 +540,40 @@ function letter(contactName: string | null, paragraph: string): string {
   return `${buildGreeting(contactName)}\n\n${paragraph}`;
 }
 
+export function citedSlotStart(text: string, now: Date): Date | null {
+  const date = citedDate(text);
+  const clock = citedClock(text);
+  if (!date || !clock) {
+    return null;
+  }
+  const parts = parseGermanDate(date);
+  if (!parts) {
+    return null;
+  }
+  const year = parts.year ?? berlinParts(now).year;
+  let start = berlinInstant({
+    year,
+    month: parts.month,
+    day: parts.day,
+    hour: clock.hour,
+    minute: clock.minute,
+    second: 0,
+  });
+  if (parts.year === null && start.getTime() < now.getTime() - 24 * 60 * 60 * 1000) {
+    start = berlinInstant({
+      year: year + 1,
+      month: parts.month,
+      day: parts.day,
+      hour: clock.hour,
+      minute: clock.minute,
+      second: 0,
+    });
+  }
+  return start;
+}
+
 function citedWhen(body: string): string {
-  const month = MONTH_DATE.exec(body);
-  const numeric = month?.[1] ? "" : (NUMERIC_DATE.exec(body)?.[1] ?? "");
-  const date = (month?.[1] ?? numeric).replace(/\s+/g, " ").trim();
+  const date = citedDate(body);
   if (!date) {
     return "";
   }
@@ -552,6 +582,62 @@ function citedWhen(body: string): string {
     return date;
   }
   return `${date}, ${time[1].replace(/\s+/g, " ").trim()}`;
+}
+
+function citedDate(text: string): string {
+  const month = MONTH_DATE.exec(text);
+  const numeric = month?.[1] ? "" : (NUMERIC_DATE.exec(text)?.[1] ?? "");
+  return (month?.[1] ?? numeric).replace(/\s+/g, " ").trim();
+}
+
+function citedClock(text: string): { hour: number; minute: number } | null {
+  const match = CLOCK_TIME.exec(text);
+  if (!match?.[1]) {
+    return null;
+  }
+  const parsed = /^(\d{1,2})(?::(\d{2}))?\s*uhr$/i.exec(match[1].trim());
+  if (!parsed?.[1]) {
+    return null;
+  }
+  const hour = Number(parsed[1]);
+  const minute = parsed[2] ? Number(parsed[2]) : 0;
+  if (hour > 23 || minute > 59) {
+    return null;
+  }
+  return { hour, minute };
+}
+
+function parseGermanDate(date: string): { day: number; month: number; year: number | null } | null {
+  const numeric = /^(\d{1,2})\.(\d{1,2})\.(\d{2,4})$/.exec(date.trim());
+  if (numeric?.[1] && numeric[2] && numeric[3]) {
+    const day = Number(numeric[1]);
+    const month = Number(numeric[2]);
+    const year = numeric[3].length === 2 ? 2000 + Number(numeric[3]) : Number(numeric[3]);
+    if (!validDate(day, month)) {
+      return null;
+    }
+    return { day, month, year };
+  }
+  const named = /^(\d{1,2})\.\s*([a-zä]+)(?:\s+(\d{4}))?$/i.exec(date.trim());
+  if (!named?.[1] || !named[2]) {
+    return null;
+  }
+  const day = Number(named[1]);
+  const month = monthNumber(named[2]);
+  if (!month || !validDate(day, month)) {
+    return null;
+  }
+  return { day, month, year: named[3] ? Number(named[3]) : null };
+}
+
+function monthNumber(name: string): number | null {
+  const folded = name.toLowerCase() === "maerz" ? "märz" : name.toLowerCase();
+  const index = MONTHS.findIndex((month) => month.toLowerCase() === folded);
+  return index < 0 ? null : index + 1;
+}
+
+function validDate(day: number, month: number): boolean {
+  return day >= 1 && day <= 31 && month >= 1 && month <= 12;
 }
 
 function citedPlace(body: string): string {
@@ -565,6 +651,10 @@ function haystack(subject: string, body: string): string {
 
 function findPhrase(text: string, phrases: readonly string[]): string {
   return phrases.find((phrase) => text.includes(phrase)) ?? "";
+}
+
+export function quotedRejection(subject: string, body: string): string {
+  return findPhrase(haystack(subject, body), REJECTION_PHRASES);
 }
 
 function overlaps(start: Date, end: Date, interval: BusyInterval): boolean {

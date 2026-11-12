@@ -93,7 +93,12 @@ function isTagBoundary(source: string, index: number): boolean {
 }
 
 function htmlToText(html: string): string {
-  const withLinks = html.replace(/<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>/gi, " $1 ");
+  const withoutNoise = html
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/<head\b[^>]*>[\s\S]*?<\/head>/gi, "")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "")
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "");
+  const withLinks = withoutNoise.replace(/<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>/gi, " $1 ");
   const text = withLinks
     .replace(/<br\s*\/?>/gi, "\n")
     .replace(/<\/(p|div|tr|h[1-6]|li|blockquote|table)>/gi, "\n")
@@ -101,15 +106,57 @@ function htmlToText(html: string): string {
   return decodeEntities(text);
 }
 
+const NAMED_ENTITIES: Record<string, string> = {
+  nbsp: " ",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+  uuml: "ü",
+  auml: "ä",
+  ouml: "ö",
+  szlig: "ß",
+  euro: "€",
+  ndash: "–",
+  mdash: "—",
+};
+
 function decodeEntities(value: string): string {
+  let current = value;
+  for (let pass = 0; pass < 2; pass += 1) {
+    const next = decodeOnce(current);
+    if (next === current) {
+      break;
+    }
+    current = next;
+  }
+  return collapseWhitespace(current);
+}
+
+function decodeOnce(value: string): string {
+  const named = value.replace(/&amp;/gi, "&").replace(/&([a-z]+);/gi, (match, name: string) => {
+    if (name.toLowerCase() === "amp") {
+      return match;
+    }
+    const upper = name[0] === name[0]?.toUpperCase();
+    const letter = NAMED_ENTITIES[name.toLowerCase()];
+    if (!letter) {
+      return match;
+    }
+    if (upper && letter.toLowerCase() !== letter.toUpperCase()) {
+      return letter.toUpperCase();
+    }
+    return letter;
+  });
+  return named.replace(/&#(\d+);/g, (_match, digits: string) => String.fromCodePoint(Number(digits)));
+}
+
+function collapseWhitespace(value: string): string {
   return value
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#(\d+);/g, (_match, digits: string) => String.fromCodePoint(Number(digits)))
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
     .replace(/[ \t]+\n/g, "\n")
+    .replace(/^[ \t]+$/gm, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }

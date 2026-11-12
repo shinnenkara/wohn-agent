@@ -1,6 +1,7 @@
 import type { LinkMethod } from "../../domain/mail-link.js";
 import type { MailKind } from "../../domain/scout-mail.js";
 import type { CitedVisit } from "../../domain/mail-citation.js";
+import type { ActionStatus } from "../../domain/mail-action.js";
 import { isMailRelation, isMailTopic, type OpenTopic } from "../../domain/mail-reply.js";
 
 export interface StoredMail {
@@ -117,6 +118,71 @@ export interface MailReading {
   createdAt: Date;
 }
 
+export interface StoredTriageIntent {
+  code: string;
+  confidence: number;
+  summary: string;
+  metadataJson: string;
+  dskViolation: boolean;
+}
+
+export interface StoredTriageRisk {
+  level: string;
+  redFlagsJson: string;
+}
+
+export interface LoadedTriage {
+  codes: string[];
+  riskLevel: string;
+  flags: string[];
+}
+
+export interface NewMailAction {
+  scoutId: string;
+  mailId: string;
+  intentCode: string;
+  actionCode: string;
+  status: ActionStatus;
+  priority: string;
+  actionUrl: string;
+  draftResponseText: string;
+  deadlineAt: string;
+  createdAt: Date;
+}
+
+export interface StoredAction {
+  id: number;
+  scoutId: string;
+  mailId: string;
+  intentCode: string;
+  actionCode: string;
+  status: string;
+  priority: string;
+  actionUrl: string;
+  draftResponseText: string;
+  deadlineAt: string;
+}
+
+export interface OpenMailAction extends StoredAction {
+  title: string;
+  subject: string;
+  from: string;
+  address: string;
+  body: string;
+  slotText: string;
+}
+
+export interface ReplySource {
+  threadId: string;
+  messageId: string;
+  inReplyTo: string;
+  references: string;
+  replyTo: string;
+  from: string;
+  subject: string;
+  email: string | null;
+}
+
 export interface MailStore {
   insertMail(mail: StoredMail, createdAt: Date): boolean;
   latestSentAt(): string | null;
@@ -134,6 +200,9 @@ export interface MailStore {
     linkMethod: LinkMethod | "";
   }): void;
   pendingWithoutReading(): UnreadMail[];
+  pendingWithoutTriage(): UnreadMail[];
+  saveTriage(mailId: string, intents: readonly StoredTriageIntent[], risk: StoredTriageRisk): void;
+  loadTriage(mailId: string): LoadedTriage | null;
   insertReading(reading: MailReading): void;
   insertDraft(draft: StoredDraft): void;
   openTopic(scoutId: string): OpenTopic | null;
@@ -145,6 +214,17 @@ export interface MailStore {
   visits(): StoredVisit[];
   listUnlinkedMail(limit: number): UnlinkedMail[];
   listUnlinkedEvents(limit: number): UnlinkedEvent[];
+  sentAt(gmailId: string): string | null;
+  isQuarantined(scoutId: string): boolean;
+  quarantineScout(scoutId: string, at: Date): void;
+  insertAction(action: NewMailAction): boolean;
+  supersedeOpen(scoutId: string, mailId: string): void;
+  markActionsNotified(mailId: string): void;
+  setActionStatus(id: number, status: ActionStatus): void;
+  blockOpenActions(scoutId: string): void;
+  listActions(): StoredAction[];
+  listOpenActions(): OpenMailAction[];
+  replySource(mailId: string): ReplySource | null;
 }
 
 export function visitFromPayload(payload: string): CitedVisit | null {

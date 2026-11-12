@@ -1,8 +1,19 @@
 import { z } from "zod";
-import { MailReaderRateLimit, type MailInterpretation, type MailReader } from "../../application/ports/mail-reader.js";
+import {
+  MailReaderRateLimit,
+  type MailInterpretation,
+  type MailReader,
+  type MailTriageInput,
+} from "../../application/ports/mail-reader.js";
 import type { MailResolver, MailResolveInput } from "../../application/ports/mail-resolver.js";
 import { emptyProposal, type MailProposal } from "../../domain/mail-citation.js";
 import { MAIL_INTENTS, MAIL_RELATIONS } from "../../domain/mail-reply.js";
+import {
+  DOCUMENT_CODES,
+  INTENT_CODES,
+  RED_FLAGS,
+  type ProposedTriage,
+} from "../../domain/triage.js";
 
 const CitedSchema = z.object({
   text: z.string().optional(),
@@ -28,6 +39,38 @@ const ProposalSchema = z.object({
 
 const ResolveSchema = z.object({
   scoutId: z.string().optional(),
+});
+
+const TriageSchema = z.object({
+  intents: z
+    .array(
+      z.object({
+        intentCode: z.string().optional(),
+        confidence: z.number().optional(),
+        summary: z.string().optional(),
+        citation: z.string().optional(),
+        actionDeepLink: z.string().optional(),
+        linkCitation: z.string().optional(),
+        requestedDocuments: z.array(z.string()).optional(),
+        proposedSlots: z
+          .array(
+            z.object({
+              text: z.string().optional(),
+              citation: z.string().optional(),
+            }),
+          )
+          .optional(),
+      }),
+    )
+    .optional(),
+  redFlags: z
+    .array(
+      z.object({
+        code: z.string().optional(),
+        citation: z.string().optional(),
+      }),
+    )
+    .optional(),
 });
 
 export class GeminiMailReader implements MailReader, MailResolver {
@@ -69,6 +112,11 @@ export class GeminiMailReader implements MailReader, MailResolver {
     return toInterpretation(ProposalSchema.parse(JSON.parse(text)));
   }
 
+  async triage(input: MailTriageInput): Promise<ProposedTriage> {
+    const text = await this.complete(triagePrompt(input), triageSchema(), TRIAGE_SYSTEM);
+    return toProposed(TriageSchema.parse(JSON.parse(text)));
+  }
+
   async resolve(input: MailResolveInput): Promise<string | null> {
     const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(this.model)}:generateContent`;
     const response = await this.fetchImpl(endpoint, {
@@ -106,6 +154,42 @@ export class GeminiMailReader implements MailReader, MailResolver {
       return null;
     }
     return id;
+  }
+
+  private async complete(promptText: string, responseSchema: Record<string, unknown>, system = ""): Promise<string> {
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(this.model)}:generateContent`;
+    const body: Record<string, unknown> = {
+      contents: [{ role: "user", parts: [{ text: promptText }] }],
+      generationConfig: {
+        responseMimeType: "application/json",
+        responseSchema,
+      },
+    };
+    if (system) {
+      body.systemInstruction = { parts: [{ text: system }] };
+    }
+    const response = await this.fetchImpl(endpoint, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-goog-api-key": this.apiKey,
+      },
+      body: JSON.stringify(body),
+    });
+    if (response.status === 429) {
+      throw new MailReaderRateLimit(retryAfterMs(response.headers.get("retry-after")));
+    }
+    if (!response.ok) {
+      throw new Error(`gemini returned ${response.status}`);
+    }
+    const payload = (await response.json()) as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    };
+    const text = payload.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) {
+      throw new Error("gemini returned no text");
+    }
+    return text;
   }
 }
 
@@ -203,6 +287,88 @@ function schema(): Record<string, unknown> {
       intent: { type: "string", enum: [...MAIL_INTENTS] },
       relation: { type: "string", enum: [...MAIL_RELATIONS] },
       evidence: { type: "string" },
+    },
+  };
+}
+
+const TRIAGE_SYSTEM =
+  "You triage one landlord or portal email about a Berlin apartment application. " +
+  "Return every distinct intent you can cite. " +
+  `intentCode is one of: ${INTENT_CODES.join(", ")}. ` +
+  `requestedDocuments is a subset of: ${DOCUMENT_CODES.join(", ")}. ` +
+  `redFlags.code is one of: ${RED_FLAGS.join(", ")}. ` +
+  "citation, linkCitation, and each proposedSlots.citation must be exact substrings of the email. " +
+  "Leave actionDeepLink empty when the email has no http link. " +
+  "Do not assign a priority or a risk level.";
+
+function triagePrompt(input: MailTriageInput): string {
+  return `Stage: ${input.stage ?? "unknown"}\n\nSubject: ${input.subject}\n\n${input.body}`;
+}
+
+function toProposed(parsed: z.infer<typeof TriageSchema>): ProposedTriage {
+  return {
+    intents: (parsed.intents ?? []).map((intent) => ({
+      code: intent.intentCode ?? "",
+      confidence: intent.confidence ?? 0,
+      summary: intent.summary ?? "",
+      citation: intent.citation ?? "",
+      deepLink: intent.actionDeepLink ?? "",
+      linkCitation: intent.linkCitation ?? "",
+      requestedDocuments: intent.requestedDocuments ?? [],
+      proposedSlots: (intent.proposedSlots ?? []).map((slot) => ({
+        text: slot.text ?? "",
+        citation: slot.citation ?? "",
+      })),
+    })),
+    redFlags: (parsed.redFlags ?? []).map((flag) => ({
+      code: flag.code ?? "",
+      citation: flag.citation ?? "",
+    })),
+  };
+}
+
+function triageSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      intents: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            intentCode: { type: "string", enum: [...INTENT_CODES] },
+            confidence: { type: "number" },
+            summary: { type: "string" },
+            citation: { type: "string" },
+            actionDeepLink: { type: "string" },
+            linkCitation: { type: "string" },
+            requestedDocuments: {
+              type: "array",
+              items: { type: "string", enum: [...DOCUMENT_CODES] },
+            },
+            proposedSlots: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  text: { type: "string" },
+                  citation: { type: "string" },
+                },
+              },
+            },
+          },
+        },
+      },
+      redFlags: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            code: { type: "string", enum: [...RED_FLAGS] },
+            citation: { type: "string" },
+          },
+        },
+      },
     },
   };
 }

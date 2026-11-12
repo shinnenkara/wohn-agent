@@ -36,6 +36,14 @@ export interface ApartmentMail {
   composeUrl: string;
   altComposeUrl: string;
   cleanText: string;
+  intents: string[];
+  riskLevel: string;
+  redFlags: string[];
+  documents: string[];
+  slots: string[];
+  linkUrl: string;
+  linkHost: string;
+  linksAreText: boolean;
 }
 
 export interface ApartmentTopic {

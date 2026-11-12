@@ -1,10 +1,18 @@
 import type { MailProposal } from "../../domain/mail-citation.js";
+import type { FunnelStage } from "../../domain/progress.js";
+import type { ProposedTriage } from "../../domain/triage.js";
 
 export interface MailInterpretation {
   proposal: MailProposal;
   intent: string;
   relation: string;
   evidence: string;
+}
+
+export interface MailTriageInput {
+  subject: string;
+  body: string;
+  stage: FunnelStage | null;
 }
 
 export class MailReaderRateLimit extends Error {
@@ -19,4 +27,5 @@ export class MailReaderRateLimit extends Error {
 
 export interface MailReader {
   propose(subject: string, body: string): Promise<MailInterpretation>;
+  triage?(input: MailTriageInput): Promise<ProposedTriage>;
 }

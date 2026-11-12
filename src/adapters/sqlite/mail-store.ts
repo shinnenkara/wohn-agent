@@ -2,8 +2,15 @@ import type { DatabaseSync } from "node:sqlite";
 import type {
   BackfilledMail,
   BusyInterval,
+  LoadedTriage,
   MailReading,
   MailStore,
+  NewMailAction,
+  OpenMailAction,
+  ReplySource,
+  StoredAction,
+  StoredTriageIntent,
+  StoredTriageRisk,
   StoredDraft,
   StoredEvent,
   StoredMail,
@@ -18,6 +25,7 @@ import { storedTopic, visitFromPayload } from "../../application/ports/mail-stor
 import { normalizeSubject, senderDomain, type LinkMethod } from "../../domain/mail-link.js";
 import type { OpenTopic } from "../../domain/mail-reply.js";
 import type { MailKind } from "../../domain/scout-mail.js";
+import type { ActionStatus } from "../../domain/mail-action.js";
 import { gmailUrl } from "../../domain/gmail-url.js";
 
 interface MailRow {
@@ -220,7 +228,75 @@ export class SqliteMailStore implements MailStore {
          ORDER BY CASE kind WHEN 'landlord' THEN 0 WHEN 'message_copy' THEN 1 ELSE 2 END, sent_at`,
       )
       .all() as unknown as MailRow[];
-    return rows.map((row) => ({
+    return rows.map((row) => this.toUnread(row));
+  }
+
+  pendingWithoutTriage(): UnreadMail[] {
+    const rows = this.db
+      .prepare(
+        `SELECT gmail_id, thread_id, from_addr, reply_to, subject, body_text, body_html, clean_delta_text, kind, scout_id FROM mail
+         WHERE kind IN ('landlord', 'message_copy', 'unclassified')
+           AND gmail_id NOT IN (SELECT mail_id FROM reading)
+           AND gmail_id NOT IN (SELECT mail_id FROM mail_risk)
+         ORDER BY CASE kind WHEN 'landlord' THEN 0 WHEN 'message_copy' THEN 1 ELSE 2 END, sent_at`,
+      )
+      .all() as unknown as MailRow[];
+    return rows.map((row) => this.toUnread(row));
+  }
+
+  saveTriage(mailId: string, intents: readonly StoredTriageIntent[], risk: StoredTriageRisk): void {
+    const remove = this.db.prepare("DELETE FROM mail_extracted_intents WHERE mail_id = ?");
+    const insert = this.db.prepare(
+      `INSERT INTO mail_extracted_intents (
+         mail_id, intent_code, confidence, summary, metadata_json, dsk_violation
+       ) VALUES (?, ?, ?, ?, ?, ?)`,
+    );
+    const riskWrite = this.db.prepare(
+      `INSERT INTO mail_risk (mail_id, risk_level, red_flags_json) VALUES (?, ?, ?)
+       ON CONFLICT(mail_id) DO UPDATE SET
+         risk_level = excluded.risk_level,
+         red_flags_json = excluded.red_flags_json`,
+    );
+    this.db.exec("BEGIN");
+    try {
+      remove.run(mailId);
+      for (const intent of intents) {
+        insert.run(
+          mailId,
+          intent.code,
+          intent.confidence,
+          intent.summary,
+          intent.metadataJson,
+          intent.dskViolation ? 1 : 0,
+        );
+      }
+      riskWrite.run(mailId, risk.level, risk.redFlagsJson);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  loadTriage(mailId: string): LoadedTriage | null {
+    const risk = this.db.prepare("SELECT risk_level, red_flags_json FROM mail_risk WHERE mail_id = ?").get(mailId) as
+      | { risk_level: string; red_flags_json: string }
+      | undefined;
+    if (!risk) {
+      return null;
+    }
+    const rows = this.db
+      .prepare("SELECT intent_code FROM mail_extracted_intents WHERE mail_id = ? ORDER BY intent_code")
+      .all(mailId) as unknown as Array<{ intent_code: string }>;
+    return {
+      codes: rows.map((row) => row.intent_code),
+      riskLevel: risk.risk_level,
+      flags: parseFlags(risk.red_flags_json),
+    };
+  }
+
+  private toUnread(row: MailRow): UnreadMail {
+    return {
       gmailId: row.gmail_id,
       threadId: row.thread_id,
       from: row.from_addr,
@@ -231,7 +307,7 @@ export class SqliteMailStore implements MailStore {
       cleanText: row.clean_delta_text,
       kind: mailKind(row.kind),
       scoutId: row.scout_id,
-    }));
+    };
   }
 
   insertDraft(draft: StoredDraft): void {
@@ -377,6 +453,223 @@ export class SqliteMailStore implements MailStore {
       start: row.start_at,
       place: row.place,
     }));
+  }
+
+  sentAt(gmailId: string): string | null {
+    const row = this.db.prepare("SELECT sent_at FROM mail WHERE gmail_id = ?").get(gmailId) as
+      | { sent_at: string }
+      | undefined;
+    return row?.sent_at ?? null;
+  }
+
+  isQuarantined(scoutId: string): boolean {
+    if (scoutId === "") {
+      return false;
+    }
+    const row = this.db.prepare("SELECT scout_id FROM scout_quarantine WHERE scout_id = ?").get(scoutId);
+    return row !== undefined;
+  }
+
+  quarantineScout(scoutId: string, at: Date): void {
+    if (scoutId === "") {
+      return;
+    }
+    this.db
+      .prepare("INSERT OR IGNORE INTO scout_quarantine (scout_id, created_at) VALUES (?, ?)")
+      .run(scoutId, at.toISOString());
+  }
+
+  insertAction(action: NewMailAction): boolean {
+    const result = this.db
+      .prepare(
+        `INSERT OR IGNORE INTO user_mail_actions (
+           scout_id, mail_id, intent_code, action_code, status, priority, action_url,
+           draft_response_text, deadline_at, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        action.scoutId,
+        action.mailId,
+        action.intentCode,
+        action.actionCode,
+        action.status,
+        action.priority,
+        action.actionUrl,
+        action.draftResponseText,
+        action.deadlineAt,
+        action.createdAt.toISOString(),
+      );
+    return Number(result.changes) > 0;
+  }
+
+  supersedeOpen(scoutId: string, mailId: string): void {
+    if (scoutId === "") {
+      return;
+    }
+    this.db
+      .prepare(
+        `UPDATE user_mail_actions SET status = 'SUPERSEDED'
+         WHERE scout_id = ? AND mail_id != ? AND status IN ('PENDING', 'NOTIFIED')`,
+      )
+      .run(scoutId, mailId);
+  }
+
+  markActionsNotified(mailId: string): void {
+    this.db
+      .prepare("UPDATE user_mail_actions SET status = 'NOTIFIED' WHERE mail_id = ? AND status = 'PENDING'")
+      .run(mailId);
+  }
+
+  setActionStatus(id: number, status: ActionStatus): void {
+    this.db
+      .prepare(
+        `UPDATE user_mail_actions SET status = ?
+         WHERE id = ? AND status IN ('PENDING', 'NOTIFIED', 'IN_PROGRESS')`,
+      )
+      .run(status, id);
+  }
+
+  blockOpenActions(scoutId: string): void {
+    if (scoutId === "") {
+      return;
+    }
+    this.db
+      .prepare(
+        `UPDATE user_mail_actions SET status = 'BLOCKED_SCAM'
+         WHERE scout_id = ? AND status IN ('PENDING', 'NOTIFIED', 'IN_PROGRESS')`,
+      )
+      .run(scoutId);
+  }
+
+  listActions(): StoredAction[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, scout_id, mail_id, intent_code, action_code, status, priority, action_url,
+                draft_response_text, deadline_at
+         FROM user_mail_actions ORDER BY id`,
+      )
+      .all() as unknown as ActionRow[];
+    return rows.map(toAction);
+  }
+
+  listOpenActions(): OpenMailAction[] {
+    const rows = this.db
+      .prepare(
+        `SELECT a.id, a.scout_id, a.mail_id, a.intent_code, a.action_code, a.status, a.priority,
+                a.action_url, a.draft_response_text, a.deadline_at, t.title_template,
+                m.subject, m.from_addr, m.body_text, m.clean_delta_text,
+                COALESCE(l.address, '') AS address,
+                COALESCE(i.metadata_json, '') AS metadata_json
+         FROM user_mail_actions a
+         JOIN action_templates t ON t.code = a.action_code
+         JOIN mail m ON m.gmail_id = a.mail_id
+         LEFT JOIN listings l ON l.scout_id = a.scout_id
+         LEFT JOIN mail_extracted_intents i ON i.mail_id = a.mail_id AND i.intent_code = a.intent_code
+         WHERE a.status IN ('PENDING', 'NOTIFIED', 'IN_PROGRESS')
+         ORDER BY a.id`,
+      )
+      .all() as unknown as OpenActionRow[];
+    return rows.map((row) => ({
+      ...toAction(row),
+      title: row.title_template,
+      subject: row.subject,
+      from: row.from_addr,
+      address: row.address,
+      body: `${row.clean_delta_text}\n${row.body_text}`,
+      slotText: firstSlot(row.metadata_json),
+    }));
+  }
+
+  replySource(mailId: string): ReplySource | null {
+    const row = this.db
+      .prepare(
+        `SELECT thread_id, message_id, in_reply_to, references_header, reply_to, from_addr, subject
+         FROM mail WHERE gmail_id = ?`,
+      )
+      .get(mailId) as
+      | {
+          thread_id: string;
+          message_id: string;
+          in_reply_to: string;
+          references_header: string;
+          reply_to: string;
+          from_addr: string;
+          subject: string;
+        }
+      | undefined;
+    if (!row) {
+      return null;
+    }
+    return {
+      threadId: row.thread_id,
+      messageId: row.message_id,
+      inReplyTo: row.in_reply_to,
+      references: row.references_header,
+      replyTo: row.reply_to,
+      from: row.from_addr,
+      subject: row.subject,
+      email: accountEmail(this.db),
+    };
+  }
+}
+
+interface ActionRow {
+  id: number | bigint;
+  scout_id: string;
+  mail_id: string;
+  intent_code: string;
+  action_code: string;
+  status: string;
+  priority: string;
+  action_url: string;
+  draft_response_text: string;
+  deadline_at: string;
+}
+
+interface OpenActionRow extends ActionRow {
+  title_template: string;
+  subject: string;
+  from_addr: string;
+  body_text: string;
+  clean_delta_text: string;
+  address: string;
+  metadata_json: string;
+}
+
+function toAction(row: ActionRow): StoredAction {
+  return {
+    id: Number(row.id),
+    scoutId: row.scout_id,
+    mailId: row.mail_id,
+    intentCode: row.intent_code,
+    actionCode: row.action_code,
+    status: row.status,
+    priority: row.priority,
+    actionUrl: row.action_url,
+    draftResponseText: row.draft_response_text,
+    deadlineAt: row.deadline_at,
+  };
+}
+
+function firstSlot(metadata: string): string {
+  try {
+    const parsed = JSON.parse(metadata) as { proposedSlots?: Array<{ text?: unknown }> };
+    const text = parsed.proposedSlots?.[0]?.text;
+    return typeof text === "string" ? text : "";
+  } catch {
+    return "";
+  }
+}
+
+function parseFlags(payload: string): string[] {
+  try {
+    const parsed = JSON.parse(payload) as unknown;
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed.filter((item): item is string => typeof item === "string");
+  } catch {
+    return [];
   }
 }
 

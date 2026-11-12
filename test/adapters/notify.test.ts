@@ -25,7 +25,20 @@ describe("notify", () => {
       composeUrl: "https://mail.google.com/mail/?view=cm",
       altComposeUrl: "",
       messageUrl: "https://mail.google.com/mail/u/0/#all/m1",
+      actionUrl: "",
     });
+    assert.equal(
+      formatAlert({
+        type: "MAIL_TRIAGE",
+        scoutId: "171599833",
+        priority: "P0_CRITICAL",
+        riskLevel: "SAFE",
+        summary: "portal",
+        messageUrl: "https://mail.google.com/mail/u/0/#all/m1",
+        actionUrl: "https://portal.immomio.de/invite/abc",
+      }).includes("https://portal.immomio.de/invite/abc"),
+      true,
+    );
     assert.equal(draft.includes("Open in Gmail: https://mail.google.com/mail/?view=cm"), true);
     assert.equal(draft.includes("Message: https://mail.google.com/mail/u/0/#all/m1"), true);
   });

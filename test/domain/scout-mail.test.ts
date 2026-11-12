@@ -180,6 +180,24 @@ describe("quoted replies", () => {
     assert.match(inline, /Die Miete ist 800 €/);
     assert.equal(inline.includes("alte Frage"), false);
   });
+
+  it("drops the stylesheet and keeps a short letter", () => {
+    const html = stripQuotedReply(
+      "plain fallback",
+      "<head><style>@media screen { .a { color: red } }</style><script>alert(1)</script></head><!-- tracker --><div>Danke f&uuml;r die Nachricht &ndash; 800 &euro;.</div>",
+    );
+    assert.equal(html.includes("@media"), false);
+    assert.equal(html.includes("alert"), false);
+    assert.equal(html, "Danke für die Nachricht – 800 €.");
+  });
+
+  it("collapses blank lines left by table layout", () => {
+    const html = stripQuotedReply(
+      "",
+      "<table><tr><td>Hallo</td></tr><tr><td>   </td></tr><tr><td></td></tr><tr><td>bis bald</td></tr></table>",
+    );
+    assert.equal(html, "Hallo\n\nbis bald");
+  });
 });
 
 describe("address matching", () => {

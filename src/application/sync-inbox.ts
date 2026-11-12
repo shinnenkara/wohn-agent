@@ -8,6 +8,7 @@ import type { MailResolver } from "./ports/mail-resolver.js";
 import type { Notifier } from "./ports/notifier.js";
 import type { ProgressLog } from "./ports/progress-log.js";
 import { assignMail, stageForMail } from "./assign-mail.js";
+import { materializeActions } from "./materialize-actions.js";
 import { scoutIdForEvent } from "../domain/event-link.js";
 import { gmailUrl } from "../domain/gmail-url.js";
 import { emptyProposal, validateCitation, type MailProposal } from "../domain/mail-citation.js";
@@ -33,6 +34,13 @@ import {
 import type { FunnelStage } from "../domain/progress.js";
 import { calendarNotice, parseScoutMail } from "../domain/scout-mail.js";
 import { stripQuotedReply } from "../domain/strip-reply.js";
+import {
+  confirmTriage,
+  proposeFromRules,
+  rulesSkipModel,
+  triageSummary,
+  type TriageDecision,
+} from "../domain/triage.js";
 
 export const MAIL_READINGS_PER_RUN = 5;
 export const MAIL_READING_GAP_MS = 7000;
@@ -341,7 +349,51 @@ async function readPending(deps: SyncDependencies, since: Date, result: SyncResu
     }
     const body = current.cleanText;
     const open = current.scoutId ? deps.mail.openTopic(current.scoutId) : null;
+    const stage = current.scoutId ? deps.progress.stageOf(current.scoutId) : null;
     const ruled = classifyReply(current.subject, body, open);
+    if (ruled && rulesSkipModel(current.subject, body, ruled)) {
+      await remember(
+        deps,
+        result,
+        current,
+        body,
+        ruled,
+        emptyProposal(),
+        ruled.intent === "viewing_confirm" ? citedVisit(body) : null,
+        decisionFor(current, body, stage, ruled),
+      );
+      continue;
+    }
+    if (deps.reader?.triage && reads < MAIL_READINGS_PER_RUN) {
+      if (reads > 0) {
+        await deps.clock.sleep(MAIL_READING_GAP_MS);
+      }
+      try {
+        const raw = await deps.reader.triage({ subject: current.subject, body, stage });
+        const decision = confirmTriage({ text: corpus(current.subject, body), stage, proposed: raw });
+        const classification = decision.draft
+          ? settleReply(open, decision.draft.intent, decision.draft.citation, current.subject, body)
+          : (ruled ?? { intent: "unknown" as const, relation: null, topic: null, evidence: "" });
+        await remember(
+          deps,
+          result,
+          current,
+          body,
+          classification,
+          emptyProposal(),
+          visitFor(decision, classification.intent, body),
+          decision,
+        );
+      } catch (error) {
+        if (error instanceof MailReaderRateLimit) {
+          break;
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        deps.mail.insertReading(failedReading(deps, current.gmailId, JSON.stringify({ error: message })));
+      }
+      reads += 1;
+      continue;
+    }
     if (ruled) {
       await remember(
         deps,
@@ -351,6 +403,7 @@ async function readPending(deps: SyncDependencies, since: Date, result: SyncResu
         ruled,
         emptyProposal(),
         ruled.intent === "viewing_confirm" ? citedVisit(body) : null,
+        decisionFor(current, body, stage, ruled),
       );
       continue;
     }
@@ -365,7 +418,16 @@ async function readPending(deps: SyncDependencies, since: Date, result: SyncResu
       const checked = validateCitation(body, raw.proposal);
       const classification = settleReply(open, raw.intent, raw.evidence, current.subject, body);
       const visit = checked.proposal.visit ?? (classification.intent === "viewing_confirm" ? citedVisit(body) : null);
-      await remember(deps, result, current, body, classification, checked.proposal, visit);
+      await remember(
+        deps,
+        result,
+        current,
+        body,
+        classification,
+        checked.proposal,
+        visit,
+        decisionFor(current, body, stage, classification),
+      );
     } catch (error) {
       if (error instanceof MailReaderRateLimit) {
         break;
@@ -386,28 +448,47 @@ async function remember(
   classification: MailClassification,
   proposal: MailProposal,
   visit: CitedSlot | null,
+  decision: TriageDecision | null,
 ): Promise<void> {
-  const storedVisit = visit
+  const blocked = decision?.blocked === true;
+  const storedVisit = !blocked && visit
     ? { when: visit.when, place: visit.place, citation: visit.citation }
     : null;
   const contactName = proposal.contact?.name || senderName(item.from);
-  const draft = renderDraft({
-    classification,
-    subject: item.subject,
-    body,
-    contactName,
-    slots: eveningSlots(deps.clock.now(), deps.mail.busyIntervals()),
-    visit: storedVisit,
-  });
-  deps.mail.insertDraft({
-    mailId: item.gmailId,
-    intent: classification.intent,
-    relation: classification.relation ?? "",
-    topic: classification.topic ?? "",
-    body: draft?.body ?? "",
-    altBody: draft?.altBody ?? "",
-    createdAt: deps.clock.now(),
-  });
+  const draft = blocked
+    ? null
+    : renderDraft({
+        classification,
+        subject: item.subject,
+        body,
+        contactName,
+        slots: eveningSlots(deps.clock.now(), deps.mail.busyIntervals()),
+        visit: storedVisit,
+      });
+  if (decision) {
+    deps.mail.saveTriage(
+      item.gmailId,
+      decision.intents.map((intent) => ({
+        code: intent.code,
+        confidence: intent.confidence,
+        summary: intent.summary,
+        metadataJson: JSON.stringify(intent.metadata),
+        dskViolation: intent.dskViolation,
+      })),
+      { level: decision.riskLevel, redFlagsJson: JSON.stringify(decision.redFlags) },
+    );
+  }
+  if (!blocked) {
+    deps.mail.insertDraft({
+      mailId: item.gmailId,
+      intent: classification.intent,
+      relation: classification.relation ?? "",
+      topic: classification.topic ?? "",
+      body: draft?.body ?? "",
+      altBody: draft?.altBody ?? "",
+      createdAt: deps.clock.now(),
+    });
+  }
   deps.mail.insertReading(
     proposedReading(deps, item.gmailId, {
       ...proposal,
@@ -417,19 +498,122 @@ async function remember(
       evidence: classification.evidence,
     }),
   );
-  const topic = nextTopic(item.scoutId ? deps.mail.openTopic(item.scoutId) : null, classification);
-  if (item.scoutId && topic && (classification.relation || classification.topic)) {
-    deps.mail.saveOpenTopic(item.scoutId, topic, deps.clock.now());
+  if (decision) {
+    materializeActions(deps.mail, {
+      scoutId: item.scoutId,
+      mailId: item.gmailId,
+      sentAt: deps.mail.sentAt(item.gmailId) ?? deps.clock.now().toISOString(),
+      accountEmail: deps.accounts.load()?.email ?? null,
+      draftBody: draft?.body ?? "",
+      decision,
+      createdAt: deps.clock.now(),
+    });
   }
-  if (storedVisit && item.scoutId) {
-    advance(deps, result, item.scoutId, "viewing_offered", "mail", item.gmailId);
+  if (!blocked) {
+    const topic = nextTopic(item.scoutId ? deps.mail.openTopic(item.scoutId) : null, classification);
+    if (item.scoutId && topic && (classification.relation || classification.topic)) {
+      deps.mail.saveOpenTopic(item.scoutId, topic, deps.clock.now());
+    }
+    if (storedVisit && item.scoutId) {
+      advance(deps, result, item.scoutId, "viewing_offered", "mail", item.gmailId);
+    }
   }
   result.proposals += 1;
-  if (!draft?.body) {
-    return;
+  const portal = portalUrl(decision);
+  const wantsDraft = Boolean(draft?.body) && allowsDraftAlert(decision);
+  const wantsTriage = Boolean(decision && (decision.blocked || decision.riskLevel === "WARN_DSGVO_VIOLATION" || (decision.priority === "P0_CRITICAL" && !draft?.body)));
+  let notified = false;
+  if (wantsDraft && draft?.body) {
+    result.drafts += 1;
+    notified = await notifyDraft(deps, item, classification.intent, draft.body, draft.altBody, portal);
   }
-  result.drafts += 1;
-  await notifyDraft(deps, item, classification.intent, draft.body, draft.altBody);
+  if (wantsTriage && decision) {
+    notified = (await notifyTriage(deps, item, decision, portal)) || notified;
+  }
+  if (notified) {
+    deps.mail.markActionsNotified(item.gmailId);
+  }
+}
+
+function allowsDraftAlert(decision: TriageDecision | null): boolean {
+  if (!decision) {
+    return true;
+  }
+  if (decision.blocked || !decision.notify) {
+    return false;
+  }
+  return decision.priority === "P0_CRITICAL" || decision.priority === "P1_HIGH";
+}
+
+function decisionFor(
+  item: { from: string; subject: string },
+  body: string,
+  stage: FunnelStage | null,
+  classification: MailClassification,
+): TriageDecision {
+  return confirmTriage({
+    text: corpus(item.subject, body),
+    stage,
+    proposed: proposeFromRules({
+      from: item.from,
+      subject: item.subject,
+      body,
+      classification,
+    }),
+  });
+}
+
+function visitFor(decision: TriageDecision, intent: string, body: string): CitedSlot | null {
+  if (decision.blocked) {
+    return null;
+  }
+  if (intent === "viewing_confirm" || intent === "contract_confirm") {
+    for (const extracted of decision.intents) {
+      const slot = extracted.metadata.proposedSlots[0];
+      if (slot) {
+        return { when: slot.text, place: "", citation: slot.citation };
+      }
+    }
+    return citedVisit(body);
+  }
+  return null;
+}
+
+function corpus(subject: string, body: string): string {
+  return `${subject}\n${body}`;
+}
+
+function portalUrl(decision: TriageDecision | null): string {
+  if (!decision || decision.blocked) {
+    return "";
+  }
+  return decision.intents.find((intent) => intent.metadata.actionDeepLink)?.metadata.actionDeepLink ?? "";
+}
+
+async function notifyTriage(
+  deps: SyncDependencies,
+  item: UnreadMail,
+  decision: TriageDecision,
+  actionUrl: string,
+): Promise<boolean> {
+  if (!deps.notifier) {
+    return false;
+  }
+  const email = deps.accounts.load()?.email ?? null;
+  try {
+    await deps.notifier.notify({
+      type: "MAIL_TRIAGE",
+      scoutId: item.scoutId,
+      priority: decision.priority ?? "",
+      riskLevel: decision.riskLevel,
+      summary: triageSummary(decision),
+      messageUrl: gmailUrl(item.gmailId, email),
+      actionUrl,
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function notifyDraft(
@@ -438,9 +622,10 @@ async function notifyDraft(
   intent: string,
   body: string,
   altBody: string,
-): Promise<void> {
+  actionUrl: string,
+): Promise<boolean> {
   if (!deps.notifier) {
-    return;
+    return false;
   }
   const email = deps.accounts.load()?.email ?? null;
   const to = mailboxAddress(item.replyTo, item.from);
@@ -454,9 +639,11 @@ async function notifyDraft(
       composeUrl: gmailComposeUrl({ account: email, to, subject: item.subject, body }),
       altComposeUrl: altBody ? gmailComposeUrl({ account: email, to, subject: item.subject, body: altBody }) : "",
       messageUrl: gmailUrl(item.gmailId, email),
+      actionUrl,
     });
+    return true;
   } catch {
-    return;
+    return false;
   }
 }
 

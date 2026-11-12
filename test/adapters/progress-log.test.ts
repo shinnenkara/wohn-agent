@@ -14,6 +14,7 @@ import { Listing } from "../../src/domain/listing.js";
 import { linkUnlinkedMail } from "../../src/infrastructure/link-route.js";
 import { queueExposeRefresh } from "../../src/infrastructure/refresh-route.js";
 import { repairStoredAddresses } from "../../src/infrastructure/repair-addresses.js";
+import { repairStoredMailText } from "../../src/infrastructure/repair-mail-text.js";
 import { progressPage } from "../../src/infrastructure/ui-page.js";
 import { discoverListing } from "../fakes.js";
 
@@ -189,6 +190,10 @@ describe("sqlite progress", () => {
       assert.match(page, /Seen /);
       assert.match(page, /link-mail/);
       assert.match(page, /cleanText/);
+      assert.match(page, /Show message/);
+      assert.match(page, /mail-body/);
+      assert.match(page, /mail\.intents/);
+      assert.match(page, /linksAreText/);
       assert.match(page, /Europe\/Berlin/);
       assert.match(page, /!row\.title && !row\.address && !row\.priceCold && !row\.priceWarm && !row\.rooms && !row\.areaSqm/);
     } finally {
@@ -333,6 +338,75 @@ describe("sqlite progress", () => {
         assert.equal(rows[1]?.address, "Badstr. 54, 13357 Berlin");
         assert.equal(rows[2]?.address, "Grafenberg, 40629 Düsseldorf");
         assert.equal(repairStoredAddresses(path), 0);
+      } finally {
+        check.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rewrites stored mail when the saved text still contains the stylesheet", () => {
+    const dir = mkdtempSync(join(tmpdir(), "wohn-mail-text-"));
+    const path = join(dir, "agent.db");
+    const db = openDatabase(path);
+    const at = new Date("2026-11-06T12:00:00.000Z");
+    try {
+      const mail = new SqliteMailStore(db);
+      mail.insertMail(
+        {
+          gmailId: "m-css",
+          threadId: "t-css",
+          from: "ImmoScout24 <myscout@immobilienscout24.de>",
+          subject: "Neue Nachricht",
+          sentAt: "2026-11-06T11:15:00.000Z",
+          text: "plain fallback",
+          html: "<style>@media screen { .a { color: red } }</style><div>Danke f&uuml;r die Nachricht.</div>",
+          cleanText: "@media screen { .a { color: red } }",
+          inReplyTo: "",
+          references: "",
+          linkMethod: "",
+          kind: "message_copy",
+          scoutId: "",
+          replyTo: "",
+          messageId: "",
+        },
+        at,
+      );
+      mail.insertMail(
+        {
+          gmailId: "m-ok",
+          threadId: "t-ok",
+          from: "Landlord <a@example.com>",
+          subject: "Termin",
+          sentAt: "2026-11-06T11:16:00.000Z",
+          text: "Schon sauber.",
+          html: "<div>Schon sauber.</div>",
+          cleanText: "Schon sauber.",
+          inReplyTo: "",
+          references: "",
+          linkMethod: "",
+          kind: "landlord",
+          scoutId: "",
+          replyTo: "",
+          messageId: "",
+        },
+        at,
+      );
+    } finally {
+      db.close();
+    }
+    try {
+      assert.equal(repairStoredMailText(path), 1);
+      const check = openDatabase(path);
+      try {
+        const rows = check.prepare("SELECT gmail_id, clean_delta_text FROM mail ORDER BY gmail_id").all() as Array<{
+          gmail_id: string;
+          clean_delta_text: string;
+        }>;
+        assert.equal(rows.find((row) => row.gmail_id === "m-css")?.clean_delta_text, "Danke für die Nachricht.");
+        assert.equal(rows.find((row) => row.gmail_id === "m-ok")?.clean_delta_text, "Schon sauber.");
+        assert.equal(repairStoredMailText(path), 0);
       } finally {
         check.close();
       }

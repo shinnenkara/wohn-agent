@@ -15,6 +15,7 @@
     "login": "tsx src/infrastructure/login-main.ts",
     "sync": "tsx src/infrastructure/sync-main.ts",
     "ui": "tsx src/infrastructure/ui-main.ts",
+    "console": "tsx src/infrastructure/console-main.ts",
     "chrome": "powershell -ExecutionPolicy Bypass -File scripts/start-chrome.ps1"
   },
   "dependencies": {

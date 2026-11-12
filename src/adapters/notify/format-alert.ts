@@ -15,11 +15,29 @@ export function formatAlert(alert: Alert): string {
       return `MANUAL_REQUIRED ${alert.scoutId}: ${alert.reason}\n${alert.url}`;
     case "MAIL_DRAFT":
       return formatDraft(alert);
+    case "MAIL_TRIAGE":
+      return formatTriage(alert);
   }
 }
 
+function formatTriage(alert: Extract<Alert, { type: "MAIL_TRIAGE" }>): string {
+  const lines = [`Triage (${alert.priority || alert.riskLevel}) for ${alert.scoutId}`];
+  if (alert.actionUrl) {
+    lines.push(alert.actionUrl);
+  }
+  lines.push(alert.summary);
+  if (alert.messageUrl) {
+    lines.push(`Message: ${alert.messageUrl}`);
+  }
+  return lines.join("\n\n");
+}
+
 function formatDraft(alert: Extract<Alert, { type: "MAIL_DRAFT" }>): string {
-  const lines = [`Draft (${alert.intent}) for ${alert.scoutId}`, alert.body];
+  const lines = [`Draft (${alert.intent}) for ${alert.scoutId}`];
+  if (alert.actionUrl) {
+    lines.push(alert.actionUrl);
+  }
+  lines.push(alert.body);
   if (alert.composeUrl) {
     lines.push(`Open in Gmail: ${alert.composeUrl}`);
   }

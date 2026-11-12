@@ -12,6 +12,16 @@ export type Alert =
       composeUrl: string;
       altComposeUrl: string;
       messageUrl: string;
+      actionUrl: string;
+    }
+  | {
+      type: "MAIL_TRIAGE";
+      scoutId: string;
+      priority: string;
+      riskLevel: string;
+      summary: string;
+      messageUrl: string;
+      actionUrl: string;
     };
 
 export interface Notifier {
