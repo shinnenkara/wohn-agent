@@ -4,6 +4,7 @@ import type { RuntimeConfig } from "../adapters/config/env.js";
 import { systemClock } from "../adapters/clock/system-clock.js";
 import { NoopControl } from "../adapters/control/noop-control.js";
 import { SqliteEventLog } from "../adapters/sqlite/event-log.js";
+import { SqliteExposeRefresh } from "../adapters/sqlite/expose-refresh.js";
 import { openDatabase } from "../adapters/sqlite/database.js";
 import { SqliteListingRepository } from "../adapters/sqlite/listing-repository.js";
 import { SqliteProgressLog } from "../adapters/sqlite/progress-log.js";
@@ -67,6 +68,7 @@ export function composeWith(config: RuntimeConfig, db: DatabaseSync): Applicatio
     dryRun: config.dryRun,
     overnightRun: config.overnightRun,
     progress,
+    refreshes: new SqliteExposeRefresh(db),
   };
   return {
     loop,

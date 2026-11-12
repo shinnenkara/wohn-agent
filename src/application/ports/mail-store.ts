@@ -1,3 +1,4 @@
+import type { LinkMethod } from "../../domain/mail-link.js";
 import type { MailKind } from "../../domain/scout-mail.js";
 import type { CitedVisit } from "../../domain/mail-citation.js";
 import { isMailRelation, isMailTopic, type OpenTopic } from "../../domain/mail-reply.js";
@@ -12,6 +13,10 @@ export interface StoredMail {
   sentAt: string;
   text: string;
   html: string;
+  cleanText: string;
+  inReplyTo: string;
+  references: string;
+  linkMethod: LinkMethod | "";
   kind: MailKind;
   scoutId: string;
 }
@@ -34,7 +39,36 @@ export interface UnreadMail {
   subject: string;
   text: string;
   html: string;
+  cleanText: string;
+  kind: MailKind;
   scoutId: string;
+}
+
+export interface UnresolvedMail {
+  gmailId: string;
+  threadId: string;
+  from: string;
+  subject: string;
+  text: string;
+  html: string;
+  cleanText: string;
+  inReplyTo: string;
+  references: string;
+  kind: MailKind;
+}
+
+export interface StoredThreadMail {
+  gmailId: string;
+  threadId: string;
+  from: string;
+  subject: string;
+  kind: MailKind;
+  scoutId: string;
+}
+
+export interface BackfilledMail {
+  gmailId: string;
+  kind: MailKind;
 }
 
 export interface StoredDraft {
@@ -65,6 +99,7 @@ export interface UnlinkedMail {
   from: string;
   subject: string;
   sentAt: string;
+  cleanText: string;
 }
 
 export interface UnlinkedEvent {
@@ -86,6 +121,18 @@ export interface MailStore {
   insertMail(mail: StoredMail, createdAt: Date): boolean;
   latestSentAt(): string | null;
   scoutIdForThread(threadId: string): string | null;
+  scoutIdForMessageIds(ids: readonly string[]): string | null;
+  unresolvedMail(): UnresolvedMail[];
+  findMail(gmailId: string): StoredThreadMail | null;
+  linkMessage(gmailId: string, scoutId: string, method: LinkMethod): boolean;
+  backfillThread(threadId: string, scoutId: string): BackfilledMail[];
+  saveThread(input: {
+    threadId: string;
+    subject: string;
+    from: string;
+    scoutId: string;
+    linkMethod: LinkMethod | "";
+  }): void;
   pendingWithoutReading(): UnreadMail[];
   insertReading(reading: MailReading): void;
   insertDraft(draft: StoredDraft): void;

@@ -2,14 +2,16 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { SqliteAccountStore } from "../../src/adapters/sqlite/account-store.js";
 import { openDatabase } from "../../src/adapters/sqlite/database.js";
+import { SqliteListingRepository } from "../../src/adapters/sqlite/listing-repository.js";
 import { SqliteMailStore } from "../../src/adapters/sqlite/mail-store.js";
 import { SqliteProgressLog } from "../../src/adapters/sqlite/progress-log.js";
-import { syncInbox, type SyncDependencies, type SyncOptions } from "../../src/application/sync-inbox.js";
+import { syncHasNews, syncInbox, type SyncDependencies, type SyncOptions } from "../../src/application/sync-inbox.js";
 import { MailReaderRateLimit, type MailInterpretation, type MailReader } from "../../src/application/ports/mail-reader.js";
 import type { Alert } from "../../src/application/ports/notifier.js";
 import type { Agenda, AgendaEvent, AgendaPage } from "../../src/application/ports/agenda.js";
 import type { FetchedMail, Mailbox } from "../../src/application/ports/mailbox.js";
-import { FakeClock } from "../fakes.js";
+import type { MailResolver } from "../../src/application/ports/mail-resolver.js";
+import { FakeClock, discoverListing } from "../fakes.js";
 
 class FakeMailbox implements Mailbox {
   history = "h-new";
@@ -65,6 +67,8 @@ function mail(patch: Partial<FetchedMail>): FetchedMail {
     html: "",
     replyTo: "",
     messageId: "",
+    inReplyTo: "",
+    references: "",
     calendarPart: false,
     ...patch,
   };
@@ -81,7 +85,14 @@ function options(patch?: Partial<SyncOptions>): SyncOptions {
   };
 }
 
-function setup(): { deps: SyncDependencies; mailbox: FakeMailbox; agenda: FakeAgenda; clock: FakeClock; close(): void } {
+function setup(): {
+  deps: SyncDependencies;
+  mailbox: FakeMailbox;
+  agenda: FakeAgenda;
+  clock: FakeClock;
+  db: ReturnType<typeof openDatabase>;
+  close(): void;
+} {
   const db = openDatabase(":memory:");
   const clock = new FakeClock();
   const accounts = new SqliteAccountStore(db);
@@ -98,11 +109,41 @@ function setup(): { deps: SyncDependencies; mailbox: FakeMailbox; agenda: FakeAg
     mail: new SqliteMailStore(db),
     progress: new SqliteProgressLog(db),
     reader: null,
+    resolver: null,
     clock,
     model: "gemini-3.5-flash-lite",
     notifier: null,
   };
-  return { deps, mailbox, agenda, clock, close: () => db.close() };
+  return { deps, mailbox, agenda, clock, db, close: () => db.close() };
+}
+
+function openApplied(
+  db: ReturnType<typeof openDatabase>,
+  deps: SyncDependencies,
+  scoutId: string,
+  address: string,
+  priceCold: number,
+): void {
+  const listing = discoverListing(scoutId)
+    .withDetails({
+      title: "Altbau",
+      contactName: null,
+      priceCold,
+      rooms: 2,
+      areaSqm: 50,
+      address,
+      isPlusOnly: false,
+    })
+    .startApplying()
+    .markApplied(new Date("2026-10-15T10:00:00.000Z"));
+  new SqliteListingRepository(db).save(listing);
+  deps.progress.note({
+    scoutId,
+    next: "applied",
+    source: "apply",
+    evidenceId: scoutId,
+    at: new Date("2026-10-15T10:00:00.000Z"),
+  });
 }
 
 describe("sync inbox", () => {
@@ -116,6 +157,24 @@ describe("sync inbox", () => {
       assert.equal(deps.accounts.load()?.calendarSyncToken, null);
       assert.equal(mailbox.historyCalls, 0);
       assert.equal(deps.progress.stageOf("171599833"), "applied");
+    } finally {
+      close();
+    }
+  });
+
+  it("does not advance a listing for a saved search", async () => {
+    const { deps, mailbox, close } = setup();
+    try {
+      mailbox.listed = [
+        mail({
+          id: "search",
+          subject: "Neuer Suchauftrag wurde angelegt",
+          text: "Link: https://www.immobilienscout24.de/expose/171641591",
+        }),
+      ];
+      const result = await syncInbox(deps, options({ updateCursors: false }));
+      assert.equal(result.mail, 1);
+      assert.equal(deps.progress.stageOf("171641591"), null);
     } finally {
       close();
     }
@@ -168,7 +227,7 @@ describe("sync inbox", () => {
     }
   });
 
-  it("skips calendar notices and unrelated senders, and keeps a later thread reply", async () => {
+  it("stores mail from other senders and keeps a later thread reply", async () => {
     const { deps, mailbox, close } = setup();
     try {
       mailbox.listed = [
@@ -184,9 +243,12 @@ describe("sync inbox", () => {
         }),
       ];
       const result = await syncInbox(deps, options({ updateCursors: false }));
-      assert.equal(result.mail, 2);
+      assert.equal(result.mail, 3);
+      assert.equal(deps.mail.listUnlinkedMail(20).some((item) => item.id === "other"), true);
       assert.equal(deps.progress.stageOf("171599833"), "in_conversation");
       assert.equal(deps.progress.listTransitions()[0]?.toStage, "in_conversation");
+      assert.equal(syncHasNews(result), true);
+      assert.equal(syncHasNews({ mail: 0, events: 0, proposals: 0, drafts: 0, waiting: 1, advanced: 0 }), false);
     } finally {
       close();
     }
@@ -375,6 +437,172 @@ describe("sync inbox", () => {
       assert.equal(result.proposals, 1);
       assert.equal(result.drafts, 1);
       assert.equal(deps.progress.stageOf("171599833"), "scheduled");
+    } finally {
+      close();
+    }
+  });
+
+  it("links an Immomio mail by expose id and ignores an id that is only quoted", async () => {
+    const { deps, mailbox, close } = setup();
+    try {
+      mailbox.listed = [
+        mail({
+          id: "portal",
+          threadId: "t-portal",
+          from: "Booking <booking@immomio.de>",
+          subject: "Termin",
+          text: "Objekt 171599833\nIhr Termin steht.",
+        }),
+        mail({
+          id: "quoted",
+          threadId: "t-quoted",
+          from: "Landlord <landlord@example.com>",
+          subject: "Re: Wohnung",
+          text: "Der Termin ist bestätigt.\n\nAm 1. November 2026 schrieb Vermieter:\nObjekt 171599834",
+        }),
+      ];
+      const result = await syncInbox(deps, options({ updateCursors: false }));
+      assert.equal(result.mail, 2);
+      assert.equal(deps.progress.stageOf("171599833"), "in_conversation");
+      assert.equal(deps.progress.stageOf("171599834"), null);
+      assert.equal(deps.mail.listUnlinkedMail(20).some((item) => item.id === "quoted"), true);
+    } finally {
+      close();
+    }
+  });
+
+  it("links a later message from the same thread and a reply that cites a stored message id", async () => {
+    const { deps, mailbox, close } = setup();
+    try {
+      mailbox.listed = [
+        mail({
+          id: "child",
+          threadId: "t-other",
+          from: "Booking <booking@immomio.de>",
+          subject: "Slot",
+          messageId: "<child@immomio.de>",
+          inReplyTo: "<notice@immobilienscout24.de>",
+          text: "Bitte bestätigen Sie den Slot.",
+        }),
+        mail({
+          id: "notice",
+          threadId: "t-keep",
+          messageId: "<notice@immobilienscout24.de>",
+        }),
+        mail({
+          id: "follow",
+          threadId: "t-keep",
+          from: "Booking <booking@immomio.de>",
+          subject: "Weiter",
+          text: "Wir haben den Slot.",
+        }),
+      ];
+      await syncInbox(deps, options({ updateCursors: false }));
+      const card = deps.progress.listApartments("in_conversation").find((item) => item.scoutId === "171599833");
+      assert.equal(card?.mails.length, 3);
+    } finally {
+      close();
+    }
+  });
+
+  it("links one apartment by street and zip, and leaves two rents unlinked", async () => {
+    const { deps, mailbox, db, close } = setup();
+    try {
+      openApplied(db, deps, "171599833", "Badstraße 54, 13357 Berlin", 800);
+      openApplied(db, deps, "171599834", "Hauptstraße 2, 10115 Berlin", 800);
+      mailbox.listed = [
+        mail({
+          id: "street",
+          from: "Info <info@degewo.de>",
+          threadId: "t-street",
+          subject: "Besichtigung",
+          text: "Bitte kommen Sie in die Badstraße 54, 13357 Berlin.",
+        }),
+        mail({
+          id: "rent",
+          from: "Info <info@degewo.de>",
+          threadId: "t-rent",
+          subject: "Miete",
+          text: "Die Kaltmiete beträgt 800 €.",
+        }),
+      ];
+      await syncInbox(deps, options({ updateCursors: false }));
+      assert.equal(deps.progress.stageOf("171599833"), "in_conversation");
+      assert.equal(deps.progress.stageOf("171599834"), "applied");
+      assert.equal(deps.mail.listUnlinkedMail(20).some((item) => item.id === "rent"), true);
+      const card = deps.progress.listApartments("in_conversation").find((item) => item.scoutId === "171599833");
+      assert.match(card?.mails[0]?.cleanText ?? "", /Badstraße 54/);
+    } finally {
+      close();
+    }
+  });
+
+  it("asks the model only for unresolved mail and stops after five picks", async () => {
+    const { deps, mailbox, db, close } = setup();
+    const seen: string[] = [];
+    const resolver: MailResolver = {
+      async resolve(input) {
+        seen.push(input.subject);
+        return input.subject === "Pick" ? "171599833" : null;
+      },
+    };
+    deps.resolver = resolver;
+    try {
+      openApplied(db, deps, "171599833", "Badstraße 54, 13357 Berlin", 900);
+      mailbox.listed = [
+        mail({
+          id: "pick",
+          from: "a@gmail.com",
+          threadId: "t-pick",
+          subject: "Pick",
+          sentAt: "2026-10-02T12:00:00.000Z",
+          text: "Welche Wohnung meinen Sie?",
+        }),
+        ...["m1", "m2", "m3", "m4", "m5"].map((id, index) =>
+          mail({
+            id,
+            from: "a@gmail.com",
+            threadId: `t-${id}`,
+            subject: id,
+            sentAt: `2026-10-0${index + 3}T12:00:00.000Z`,
+            text: "hello",
+          }),
+        ),
+      ];
+      const result = await syncInbox(deps, options({ updateCursors: false }));
+      assert.equal(seen.length, 5);
+      assert.equal(deps.progress.stageOf("171599833"), "in_conversation");
+      assert.equal(result.waiting >= 1, true);
+    } finally {
+      close();
+    }
+  });
+
+  it("classifies the new sentence and not the quoted document request", async () => {
+    const { deps, mailbox, close } = setup();
+    const seen: string[] = [];
+    deps.reader = {
+      async propose(subject) {
+        seen.push(subject);
+        return { proposal: { address: null, visit: null, contact: null }, intent: "documents", relation: "start", evidence: "SCHUFA" };
+      },
+    };
+    try {
+      mailbox.listed = [
+        mail({ id: "notice", threadId: "t-keep" }),
+        mail({
+          id: "thanks",
+          threadId: "t-keep",
+          from: "Landlord <landlord@example.com>",
+          subject: "Re: Wohnung",
+          text: "Vielen Dank für Ihre Anfrage.\n\nAm 1. November 2026 schrieb Vermieter:\nBitte senden Sie die SCHUFA.",
+          html: "<div>Vielen Dank für Ihre Anfrage.</div><div class=\"gmail_quote\"><blockquote>Bitte senden Sie die SCHUFA.</blockquote></div>",
+        }),
+      ];
+      const result = await syncInbox(deps, options({ updateCursors: false }));
+      assert.deepEqual(seen, []);
+      assert.equal(result.drafts, 0);
+      assert.equal(result.proposals, 1);
     } finally {
       close();
     }

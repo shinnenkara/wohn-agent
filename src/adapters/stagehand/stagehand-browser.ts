@@ -245,6 +245,7 @@ export class StagehandBrowserSession implements BrowserSession {
           title: text("h1"),
           contactName: null,
           description: text('[data-qa="expose-description"]') || text("#expose-description"),
+          addressText: text('[data-qa="is24-expose-address"]'),
           bodyText,
           hasMessageButton,
           hasExternalLink,

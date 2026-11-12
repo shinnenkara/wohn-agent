@@ -16,6 +16,8 @@ import { errorMessage } from "./error-message.js";
 import { inspectListing } from "./inspect-listing.js";
 import { notifySafely } from "./notify.js";
 import { pollSearch } from "./poll-search.js";
+import { refreshExpose } from "./refresh-expose.js";
+import type { ExposeRefreshQueue } from "./ports/expose-refresh.js";
 import type { BrowserSession } from "./ports/browser-session.js";
 import type { Clock } from "./ports/clock.js";
 import type { ControlChannel } from "./ports/control-channel.js";
@@ -43,6 +45,7 @@ export interface LoopDependencies {
   dryRun: boolean;
   overnightRun: boolean;
   progress: ProgressLog;
+  refreshes: ExposeRefreshQueue;
 }
 
 export type NightPhase = "active" | "sleeping" | "overnight";
@@ -177,6 +180,15 @@ export async function runTick(
     deps.logger.info("ImmoScout session is active");
 
     try {
+      await runQueuedRefresh(deps);
+    } catch (error) {
+      if (error instanceof CaptchaEncountered) {
+        return handleCaptcha(deps, tickState, signal, error.signal);
+      }
+      deps.logger.error("expose refresh failed", { message: errorMessage(error) });
+    }
+
+    try {
       await pollSearch(deps, searchUrl);
     } catch (error) {
       if (error instanceof CaptchaEncountered) {
@@ -233,6 +245,31 @@ export async function runTick(
     }
     deps.logger.error("poll tick failed", { message: errorMessage(error) });
     return { ...state, sleepMs: pollIntervalMs(deps.random) };
+  }
+}
+
+async function runQueuedRefresh(deps: LoopDependencies): Promise<void> {
+  const scoutId = deps.refreshes.next();
+  if (!scoutId) {
+    return;
+  }
+  const listing = deps.listings.findById(scoutId);
+  if (!listing) {
+    deps.refreshes.finish(scoutId);
+    return;
+  }
+  try {
+    const result = await refreshExpose(deps, listing);
+    if (result === "missing") {
+      deps.refreshes.fail(scoutId, "Expose was not available");
+      return;
+    }
+    deps.refreshes.finish(scoutId);
+  } catch (error) {
+    if (error instanceof CaptchaEncountered) {
+      throw error;
+    }
+    deps.refreshes.fail(scoutId, errorMessage(error));
   }
 }
 

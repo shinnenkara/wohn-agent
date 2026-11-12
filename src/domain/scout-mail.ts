@@ -101,6 +101,9 @@ function exposeId(subject: string, html: string, body: string): string {
 function kind(from: string, subject: string): MailKind {
   const sender = from.toLowerCase();
   const line = subject.toLowerCase();
+  if (line.includes("suchauftrag")) {
+    return "unclassified";
+  }
   if (sender.includes("myscout@") || line.includes("anfrage versendet")) {
     return "notice";
   }

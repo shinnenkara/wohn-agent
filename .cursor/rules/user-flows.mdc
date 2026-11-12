@@ -1,0 +1,13 @@
+---
+description: Update docs/flows.md when the operator-visible order of npm run dev, npm run sync, or npm run ui changes.
+globs: src/application/run-agent-loop.ts,src/application/poll-search.ts,src/application/inspect-listing.ts,src/application/apply-to-listing.ts,src/application/sync-inbox.ts,src/application/refresh-expose.ts,src/infrastructure/main.ts,src/infrastructure/sync-main.ts,src/infrastructure/ui-main.ts,src/infrastructure/refresh-route.ts
+alwaysApply: false
+---
+
+# User-facing flows
+
+`docs/flows.md` is the operator-visible order of `npm run dev`, `npm run sync`, and `npm run ui`. When that order changes, update `docs/flows.md` in the same change. A refactor that keeps the order leaves the file as it is.
+
+Update the diagrams when the operator would see a different sequence. Examples: polling after inspect instead of before it, dropping the Telegram alert after a sent application, or filling an expose refresh inside the progress page instead of on the next agent tick.
+
+Leave the diagrams when the sequence the operator sees stays the same. Examples: a new recovery action, a different selector, or a renamed private helper.

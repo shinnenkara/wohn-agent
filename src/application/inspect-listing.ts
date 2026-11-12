@@ -6,6 +6,7 @@ import { DomainError } from "../domain/domain-error.js";
 import { toFailureContext } from "./failure-context.js";
 import { notifySafely } from "./notify.js";
 import { persistListing } from "./note-listing-progress.js";
+import { readExpose } from "./read-expose.js";
 import type { BrowserSession } from "./ports/browser-session.js";
 import type { Clock } from "./ports/clock.js";
 import type { EventLog } from "./ports/event-log.js";
@@ -33,17 +34,10 @@ export async function inspectListing(deps: InspectDependencies, listing: Listing
   if (listing.status !== "DISCOVERED") {
     throw new DomainError(`Cannot inspect listing in status ${listing.status}`);
   }
-  if ((await deps.browser.currentUrl()) !== listing.url) {
-    await deps.browser.goto(listing.url);
-  }
-  const captcha = await deps.browser.detectCaptcha();
-  if (captcha) {
-    throw new CaptchaEncountered(captcha);
-  }
 
   let facts;
   try {
-    facts = await deps.browser.extractExpose();
+    facts = await readExpose(deps.browser, listing.url);
   } catch (error) {
     if (error instanceof CaptchaEncountered) {
       throw error;

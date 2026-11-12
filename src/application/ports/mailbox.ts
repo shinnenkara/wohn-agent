@@ -4,6 +4,8 @@ export interface FetchedMail {
   from: string;
   replyTo: string;
   messageId: string;
+  inReplyTo: string;
+  references: string;
   subject: string;
   sentAt: string;
   text: string;

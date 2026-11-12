@@ -30,6 +30,8 @@ export function readGmailMessage(message: GmailMessageJson): FetchedMail {
     from: header(message.payload, "From"),
     replyTo: header(message.payload, "Reply-To"),
     messageId: header(message.payload, "Message-ID"),
+    inReplyTo: header(message.payload, "In-Reply-To"),
+    references: header(message.payload, "References"),
     subject: header(message.payload, "Subject"),
     sentAt,
     text: text.join("\n"),

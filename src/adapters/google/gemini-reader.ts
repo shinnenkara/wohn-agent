@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { MailReaderRateLimit, type MailInterpretation, type MailReader } from "../../application/ports/mail-reader.js";
+import type { MailResolver, MailResolveInput } from "../../application/ports/mail-resolver.js";
 import { emptyProposal, type MailProposal } from "../../domain/mail-citation.js";
 import { MAIL_INTENTS, MAIL_RELATIONS } from "../../domain/mail-reply.js";
 
@@ -25,7 +26,11 @@ const ProposalSchema = z.object({
   evidence: z.string().optional(),
 });
 
-export class GeminiMailReader implements MailReader {
+const ResolveSchema = z.object({
+  scoutId: z.string().optional(),
+});
+
+export class GeminiMailReader implements MailReader, MailResolver {
   constructor(
     private readonly apiKey: string,
     private readonly model: string,
@@ -63,6 +68,45 @@ export class GeminiMailReader implements MailReader {
     }
     return toInterpretation(ProposalSchema.parse(JSON.parse(text)));
   }
+
+  async resolve(input: MailResolveInput): Promise<string | null> {
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(this.model)}:generateContent`;
+    const response = await this.fetchImpl(endpoint, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-goog-api-key": this.apiKey,
+      },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: resolvePrompt(input) }] }],
+        generationConfig: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "object",
+            properties: { scoutId: { type: "string" } },
+          },
+        },
+      }),
+    });
+    if (response.status === 429) {
+      throw new MailReaderRateLimit(retryAfterMs(response.headers.get("retry-after")));
+    }
+    if (!response.ok) {
+      throw new Error(`gemini returned ${response.status}`);
+    }
+    const payload = (await response.json()) as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    };
+    const text = payload.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) {
+      throw new Error("gemini returned no text");
+    }
+    const id = ResolveSchema.parse(JSON.parse(text)).scoutId?.trim() ?? "";
+    if (!input.candidates.some((candidate) => candidate.scoutId === id)) {
+      return null;
+    }
+    return id;
+  }
 }
 
 function toInterpretation(parsed: z.infer<typeof ProposalSchema>): MailInterpretation {
@@ -94,6 +138,22 @@ function toProposal(parsed: z.infer<typeof ProposalSchema>): MailProposal {
     };
   }
   return proposal;
+}
+
+function resolvePrompt(input: MailResolveInput): string {
+  const lines = input.candidates.map(
+    (candidate) =>
+      `${candidate.scoutId} | ${candidate.title ?? ""} | ${candidate.address ?? ""} | ${candidate.priceCold ?? ""}`,
+  );
+  return (
+    "Choose the one open apartment application this email belongs to. " +
+    "scoutId must be copied from the list. Use an empty scoutId when none of the apartments fit.\n\n" +
+    lines.join("\n") +
+    "\n\nSubject: " +
+    input.subject +
+    "\n\n" +
+    input.body
+  );
 }
 
 function prompt(subject: string, body: string): string {

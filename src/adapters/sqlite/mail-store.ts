@@ -1,18 +1,23 @@
 import type { DatabaseSync } from "node:sqlite";
 import type {
+  BackfilledMail,
   BusyInterval,
   MailReading,
   MailStore,
   StoredDraft,
   StoredEvent,
   StoredMail,
+  StoredThreadMail,
   StoredVisit,
   UnlinkedEvent,
   UnlinkedMail,
   UnreadMail,
+  UnresolvedMail,
 } from "../../application/ports/mail-store.js";
 import { storedTopic, visitFromPayload } from "../../application/ports/mail-store.js";
+import { normalizeSubject, senderDomain, type LinkMethod } from "../../domain/mail-link.js";
 import type { OpenTopic } from "../../domain/mail-reply.js";
+import type { MailKind } from "../../domain/scout-mail.js";
 import { gmailUrl } from "../../domain/gmail-url.js";
 
 interface MailRow {
@@ -23,6 +28,8 @@ interface MailRow {
   subject: string;
   body_text: string;
   body_html: string;
+  clean_delta_text: string;
+  kind: string;
   scout_id: string;
 }
 
@@ -48,8 +55,9 @@ export class SqliteMailStore implements MailStore {
     const result = this.db
       .prepare(
         `INSERT OR IGNORE INTO mail (
-           gmail_id, thread_id, from_addr, reply_to, message_id, subject, sent_at, body_text, body_html, kind, scout_id, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           gmail_id, thread_id, from_addr, reply_to, message_id, in_reply_to, references_header,
+           subject, sent_at, body_text, body_html, clean_delta_text, kind, scout_id, link_method, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         mail.gmailId,
@@ -57,12 +65,16 @@ export class SqliteMailStore implements MailStore {
         mail.from,
         mail.replyTo,
         mail.messageId,
+        mail.inReplyTo,
+        mail.references,
         mail.subject,
         mail.sentAt,
         mail.text,
         mail.html,
+        mail.cleanText,
         mail.kind,
         mail.scoutId,
+        mail.linkMethod,
         createdAt.toISOString(),
       );
     return Number(result.changes) > 0;
@@ -82,10 +94,127 @@ export class SqliteMailStore implements MailStore {
     return row?.scout_id ?? null;
   }
 
+  scoutIdForMessageIds(ids: readonly string[]): string | null {
+    if (ids.length === 0) {
+      return null;
+    }
+    const placeholders = ids.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT scout_id FROM mail WHERE message_id IN (${placeholders}) AND scout_id != ''`,
+      )
+      .all(...ids) as Array<{ scout_id: string }>;
+    if (rows.length !== 1) {
+      return null;
+    }
+    return rows[0]?.scout_id ?? null;
+  }
+
+  unresolvedMail(): UnresolvedMail[] {
+    const rows = this.db
+      .prepare(
+        `SELECT gmail_id, thread_id, from_addr, subject, body_text, body_html, clean_delta_text,
+                in_reply_to, references_header, kind
+         FROM mail WHERE scout_id = '' ORDER BY sent_at`,
+      )
+      .all() as unknown as Array<{
+      gmail_id: string;
+      thread_id: string;
+      from_addr: string;
+      subject: string;
+      body_text: string;
+      body_html: string;
+      clean_delta_text: string;
+      in_reply_to: string;
+      references_header: string;
+      kind: string;
+    }>;
+    return rows.map((row) => ({
+      gmailId: row.gmail_id,
+      threadId: row.thread_id,
+      from: row.from_addr,
+      subject: row.subject,
+      text: row.body_text,
+      html: row.body_html,
+      cleanText: row.clean_delta_text,
+      inReplyTo: row.in_reply_to,
+      references: row.references_header,
+      kind: mailKind(row.kind),
+    }));
+  }
+
+  findMail(gmailId: string): StoredThreadMail | null {
+    const row = this.db
+      .prepare(
+        `SELECT gmail_id, thread_id, from_addr, subject, kind, scout_id FROM mail WHERE gmail_id = ?`,
+      )
+      .get(gmailId) as
+      | { gmail_id: string; thread_id: string; from_addr: string; subject: string; kind: string; scout_id: string }
+      | undefined;
+    if (!row) {
+      return null;
+    }
+    return {
+      gmailId: row.gmail_id,
+      threadId: row.thread_id,
+      from: row.from_addr,
+      subject: row.subject,
+      kind: mailKind(row.kind),
+      scoutId: row.scout_id,
+    };
+  }
+
+  linkMessage(gmailId: string, scoutId: string, method: LinkMethod): boolean {
+    const result = this.db
+      .prepare("UPDATE mail SET scout_id = ?, link_method = ? WHERE gmail_id = ? AND scout_id = ''")
+      .run(scoutId, method, gmailId);
+    return Number(result.changes) > 0;
+  }
+
+  backfillThread(threadId: string, scoutId: string): BackfilledMail[] {
+    const rows = this.db
+      .prepare("SELECT gmail_id, kind FROM mail WHERE thread_id = ? AND scout_id = ''")
+      .all(threadId) as unknown as Array<{ gmail_id: string; kind: string }>;
+    if (rows.length === 0) {
+      return [];
+    }
+    this.db
+      .prepare("UPDATE mail SET scout_id = ?, link_method = 'thread' WHERE thread_id = ? AND scout_id = ''")
+      .run(scoutId, threadId);
+    return rows.map((row) => ({ gmailId: row.gmail_id, kind: mailKind(row.kind) }));
+  }
+
+  saveThread(input: {
+    threadId: string;
+    subject: string;
+    from: string;
+    scoutId: string;
+    linkMethod: LinkMethod | "";
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO email_threads (
+           provider_thread_id, subject_normalized, sender_domain, scout_id, link_method
+         ) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(provider_thread_id) DO UPDATE SET
+           subject_normalized = excluded.subject_normalized,
+           sender_domain = CASE WHEN email_threads.sender_domain = '' THEN excluded.sender_domain ELSE email_threads.sender_domain END,
+           scout_id = CASE WHEN email_threads.scout_id = '' THEN excluded.scout_id ELSE email_threads.scout_id END,
+           link_method = CASE WHEN email_threads.scout_id = '' THEN excluded.link_method ELSE email_threads.link_method END`,
+      )
+      .run(
+        input.threadId,
+        normalizeSubject(input.subject),
+        senderDomain(input.from),
+        input.scoutId,
+        input.linkMethod,
+      );
+  }
+
   pendingWithoutReading(): UnreadMail[] {
     const rows = this.db
       .prepare(
-        `SELECT gmail_id, thread_id, from_addr, reply_to, subject, body_text, body_html, scout_id FROM mail
+        `SELECT gmail_id, thread_id, from_addr, reply_to, subject, body_text, body_html, clean_delta_text, kind, scout_id FROM mail
          WHERE kind IN ('landlord', 'message_copy', 'unclassified')
            AND gmail_id NOT IN (SELECT mail_id FROM reading)
          ORDER BY CASE kind WHEN 'landlord' THEN 0 WHEN 'message_copy' THEN 1 ELSE 2 END, sent_at`,
@@ -99,6 +228,8 @@ export class SqliteMailStore implements MailStore {
       subject: row.subject,
       text: row.body_text,
       html: row.body_html,
+      cleanText: row.clean_delta_text,
+      kind: mailKind(row.kind),
       scoutId: row.scout_id,
     }));
   }
@@ -212,10 +343,16 @@ export class SqliteMailStore implements MailStore {
   listUnlinkedMail(limit: number): UnlinkedMail[] {
     const rows = this.db
       .prepare(
-        `SELECT gmail_id, from_addr, subject, sent_at FROM mail
+        `SELECT gmail_id, from_addr, subject, sent_at, clean_delta_text FROM mail
          WHERE scout_id = '' ORDER BY sent_at DESC LIMIT ?`,
       )
-      .all(limit) as unknown as Array<{ gmail_id: string; from_addr: string; subject: string; sent_at: string }>;
+      .all(limit) as unknown as Array<{
+      gmail_id: string;
+      from_addr: string;
+      subject: string;
+      sent_at: string;
+      clean_delta_text: string;
+    }>;
     const email = accountEmail(this.db);
     return rows.map((row) => ({
       id: row.gmail_id,
@@ -223,6 +360,7 @@ export class SqliteMailStore implements MailStore {
       from: row.from_addr,
       subject: row.subject,
       sentAt: row.sent_at,
+      cleanText: row.clean_delta_text,
     }));
   }
 
@@ -245,6 +383,13 @@ export class SqliteMailStore implements MailStore {
 function accountEmail(db: DatabaseSync): string | null {
   const row = db.prepare("SELECT email FROM google_account WHERE id = 1").get() as { email: string } | undefined;
   return row?.email ?? null;
+}
+
+function mailKind(value: string): MailKind {
+  if (value === "notice" || value === "message_copy" || value === "landlord" || value === "unclassified") {
+    return value;
+  }
+  return "unclassified";
 }
 
 function toEvent(row: EventRow): StoredEvent {

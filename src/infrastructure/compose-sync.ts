@@ -57,6 +57,7 @@ export function composeSync(config: GoogleConfig): SyncApplication {
           mail: new SqliteMailStore(db),
           progress,
           reader,
+          resolver: reader,
           notifier,
           clock: systemClock,
           model: config.geminiModel,

@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import { applyToListing } from "../../src/application/apply-to-listing.js";
 import { inspectListing } from "../../src/application/inspect-listing.js";
 import { pollSearch } from "../../src/application/poll-search.js";
+import { refreshExpose } from "../../src/application/refresh-expose.js";
 import { runAgentLoop, runTick } from "../../src/application/run-agent-loop.js";
 import { CaptchaBreaker } from "../../src/domain/circuit-breaker.js";
 import { CaptchaEncountered } from "../../src/domain/captcha-signal.js";
@@ -67,6 +68,49 @@ describe("poll and inspect", () => {
     assert.equal(kept?.status, "DISCOVERED");
   });
 
+  it("fills an empty expose without moving the funnel", async () => {
+    const harness = createHarness();
+    const listing = discoverListing("171641591");
+    harness.listings.save(listing);
+    harness.progress.note({
+      scoutId: listing.scoutId,
+      next: "discovered",
+      source: "apply",
+      evidenceId: listing.scoutId,
+      at: harness.clock.now(),
+    });
+    harness.progress.note({
+      scoutId: listing.scoutId,
+      next: "applied",
+      source: "mail",
+      evidenceId: "1a1a73fb70962a18",
+      at: harness.clock.now(),
+    });
+    harness.browser.expose = sampleExpose({ title: "From expose", snapshot: "The expose body" });
+    assert.equal(await refreshExpose(harness.loop, listing), "filled");
+    const stored = harness.listings.findById(listing.scoutId);
+    assert.equal(stored?.title, "From expose");
+    assert.equal(stored?.status, "DISCOVERED");
+    assert.equal(stored?.snapshot, "The expose body");
+    assert.equal(harness.progress.stageOf(listing.scoutId), "applied");
+    assert.equal(harness.progress.listTransitions().length, 1);
+    harness.browser.expose = sampleExpose({ title: "Other title" });
+    assert.equal(await refreshExpose(harness.loop, stored ?? listing), "skipped");
+    assert.equal(harness.listings.findById(listing.scoutId)?.title, "From expose");
+  });
+
+  it("leaves the listing untouched when the expose cannot be read", async () => {
+    const harness = createHarness();
+    const listing = discoverListing("171728408");
+    harness.listings.save(listing);
+    harness.browser.extractExpose = async () => {
+      throw new Error("gone");
+    };
+    assert.equal(await refreshExpose(harness.loop, listing), "missing");
+    assert.equal(harness.listings.findById(listing.scoutId)?.title, null);
+    assert.equal(harness.listings.findById(listing.scoutId)?.status, "DISCOVERED");
+  });
+
   it("filters a blacklisted listing before opening the contact form", async () => {
     const harness = createHarness();
     harness.browser.expose = sampleExpose({ description: "Nur als Tauschwohnung abzugeben" });
@@ -118,6 +162,7 @@ describe("apply", () => {
     );
     assert.equal(harness.classifier.contexts.length, 0);
     assert.equal(harness.selectors.get("open_contact_drawer")?.selector, "#contact");
+    assert.equal(harness.listings.findById(listing.scoutId)?.sentMessage, harness.browser.messages[0]);
     assert.equal(harness.notifier.alerts[0]?.type, "APPLIED");
     if (harness.notifier.alerts[0]?.type === "APPLIED") {
       assert.equal(harness.notifier.alerts[0].title, "Altbau");
@@ -139,6 +184,8 @@ describe("apply", () => {
     const result = await applyToListing(harness.apply, listing, harness.profile);
     assert.equal(result.kind, "previewed");
     assert.equal(result.listing.status, "DISCOVERED");
+    assert.equal(result.listing.sentMessage, "");
+    assert.equal(harness.listings.findById(listing.scoutId)?.sentMessage, "");
     assert.equal(result.listing.retryCount, 0);
     assert.equal(harness.browser.submitSelectors.length, 0);
     assert.equal(harness.browser.messages.length, 1);

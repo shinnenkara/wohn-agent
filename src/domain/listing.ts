@@ -43,6 +43,7 @@ export interface ListingData {
   retryCount: number;
   discoveredAt: Date;
   appliedAt: Date | null;
+  sentMessage: string;
 }
 
 const TRANSITIONS: Record<ListingStatus, readonly ListingStatus[]> = {
@@ -99,6 +100,7 @@ export class Listing {
       retryCount: 0,
       discoveredAt: input.discoveredAt,
       appliedAt: null,
+      sentMessage: "",
     });
   }
 
@@ -205,6 +207,10 @@ export class Listing {
     return this.data.appliedAt;
   }
 
+  get sentMessage(): string {
+    return this.data.sentMessage;
+  }
+
   toData(): ListingData {
     return { ...this.data };
   }
@@ -270,12 +276,34 @@ export class Listing {
     return this.move("DISCOVERED", { errorCode: null });
   }
 
+  withSentMessage(message: string): Listing {
+    return new Listing({ ...this.data, sentMessage: message });
+  }
+
   private move(status: ListingStatus, patch: Partial<ListingData>): Listing {
     if (!TRANSITIONS[this.data.status].includes(status)) {
       throw new DomainError(`Cannot transition ${this.data.status} to ${status}`);
     }
     return new Listing({ ...this.data, ...patch, status });
   }
+}
+
+export function lacksExposeFacts(facts: {
+  title: string | null;
+  address: string | null;
+  priceCold: number | null;
+  priceWarm: number | null;
+  rooms: number | null;
+  areaSqm: number | null;
+}): boolean {
+  return (
+    !facts.title &&
+    !facts.address &&
+    facts.priceCold === null &&
+    facts.priceWarm === null &&
+    facts.rooms === null &&
+    facts.areaSqm === null
+  );
 }
 
 function textOrNull(value: string | null | undefined, max: number): string | null {

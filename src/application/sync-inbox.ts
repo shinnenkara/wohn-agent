@@ -4,11 +4,19 @@ import type { Clock } from "./ports/clock.js";
 import type { Mailbox, FetchedMail } from "./ports/mailbox.js";
 import type { MailStore, UnreadMail } from "./ports/mail-store.js";
 import { MailReaderRateLimit, type MailReader } from "./ports/mail-reader.js";
+import type { MailResolver } from "./ports/mail-resolver.js";
 import type { Notifier } from "./ports/notifier.js";
 import type { ProgressLog } from "./ports/progress-log.js";
+import { assignMail, stageForMail } from "./assign-mail.js";
 import { scoutIdForEvent } from "../domain/event-link.js";
 import { gmailUrl } from "../domain/gmail-url.js";
 import { emptyProposal, validateCitation, type MailProposal } from "../domain/mail-citation.js";
+import {
+  chooseLink,
+  matchAddress,
+  referencedMessageIds,
+  type MailCandidate,
+} from "../domain/mail-link.js";
 import {
   citedVisit,
   classifyReply,
@@ -23,10 +31,12 @@ import {
   type MailClassification,
 } from "../domain/mail-reply.js";
 import type { FunnelStage } from "../domain/progress.js";
-import { calendarNotice, fromScout, parseScoutMail, type MailKind } from "../domain/scout-mail.js";
+import { calendarNotice, parseScoutMail } from "../domain/scout-mail.js";
+import { stripQuotedReply } from "../domain/strip-reply.js";
 
 export const MAIL_READINGS_PER_RUN = 5;
 export const MAIL_READING_GAP_MS = 7000;
+export const SYNC_WATCH_MS = 15_000;
 
 export interface SyncDependencies {
   accounts: AccountStore;
@@ -35,6 +45,7 @@ export interface SyncDependencies {
   mail: MailStore;
   progress: ProgressLog;
   reader: MailReader | null;
+  resolver: MailResolver | null;
   notifier: Notifier | null;
   clock: Clock;
   model: string;
@@ -66,13 +77,17 @@ export async function syncInbox(deps: SyncDependencies, options: SyncOptions): P
   await syncMail(deps, account.gmailHistoryId, options, result);
   const fresh = deps.accounts.load();
   await syncEvents(deps, fresh?.calendarSyncToken ?? account.calendarSyncToken, options, result);
-  await readPending(deps, result);
+  await readPending(deps, options.since, result);
   relinkEvents(deps, result);
   return result;
 }
 
 export function formatSyncResult(result: SyncResult): string {
   return `Stored ${result.mail} mail, ${result.events} events. Advanced ${result.advanced} apartments. Read ${result.proposals} proposals. Wrote ${result.drafts} drafts. ${result.waiting} mail still waiting.`;
+}
+
+export function syncHasNews(result: SyncResult): boolean {
+  return result.mail > 0 || result.events > 0 || result.advanced > 0 || result.drafts > 0;
 }
 
 async function syncMail(
@@ -109,26 +124,27 @@ async function syncMail(
       nextHistory = added.latestId;
     }
   }
+  const candidates = deps.progress.openApplications(options.since);
   for (const item of fetched) {
-    ingestMail(deps, item, result);
+    ingestMail(deps, item, candidates, result);
   }
+  relinkUnresolved(deps, candidates, result);
   if (options.updateCursors && nextHistory) {
     deps.accounts.saveGmailHistory(nextHistory);
   }
 }
 
-function ingestMail(deps: SyncDependencies, item: FetchedMail, result: SyncResult): void {
+function ingestMail(
+  deps: SyncDependencies,
+  item: FetchedMail,
+  candidates: readonly MailCandidate[],
+  result: SyncResult,
+): void {
   if (calendarNotice(item.from, item.subject, item.calendarPart)) {
     return;
   }
-  const parsed = parseScoutMail(item.from, item.subject, item.text, item.html);
-  const threadScout = deps.mail.scoutIdForThread(item.threadId);
-  const scoutSender = fromScout(item.from);
-  if (!scoutSender && !threadScout) {
-    return;
-  }
-  const scoutId = parsed.exposeId || threadScout || "";
-  const kind: MailKind = !scoutSender && threadScout ? "landlord" : parsed.kind;
+  const clean = stripQuotedReply(item.text, item.html);
+  const parsed = parseScoutMail(item.from, item.subject, clean, "");
   const inserted = deps.mail.insertMail(
     {
       gmailId: item.id,
@@ -136,12 +152,16 @@ function ingestMail(deps: SyncDependencies, item: FetchedMail, result: SyncResul
       from: item.from,
       replyTo: item.replyTo,
       messageId: item.messageId,
+      inReplyTo: item.inReplyTo,
+      references: item.references,
       subject: item.subject,
       sentAt: item.sentAt,
       text: item.text,
       html: item.html,
-      kind,
-      scoutId,
+      cleanText: clean,
+      linkMethod: "",
+      kind: parsed.kind,
+      scoutId: "",
     },
     deps.clock.now(),
   );
@@ -149,22 +169,77 @@ function ingestMail(deps: SyncDependencies, item: FetchedMail, result: SyncResul
     return;
   }
   result.mail += 1;
-  const stage = stageForMail(kind);
-  if (scoutId && stage) {
-    advance(deps, result, scoutId, stage, "mail", item.id);
+  deps.mail.saveThread({
+    threadId: item.threadId,
+    subject: item.subject,
+    from: item.from,
+    scoutId: "",
+    linkMethod: "",
+  });
+  const decision = chooseLink(signalsFor(deps, candidates, {
+    from: item.from,
+    subject: item.subject,
+    cleanText: clean,
+    threadId: item.threadId,
+    inReplyTo: item.inReplyTo,
+    references: item.references,
+  }));
+  if (!decision.method) {
+    return;
+  }
+  result.advanced += assignMail(deps, {
+    gmailId: item.id,
+    threadId: item.threadId,
+    from: item.from,
+    subject: item.subject,
+    kind: parsed.kind,
+    scoutId: decision.scoutId,
+    method: decision.method,
+  });
+}
+
+function relinkUnresolved(
+  deps: SyncDependencies,
+  candidates: readonly MailCandidate[],
+  result: SyncResult,
+): void {
+  for (const item of deps.mail.unresolvedMail()) {
+    const decision = chooseLink(signalsFor(deps, candidates, item));
+    if (!decision.method) {
+      continue;
+    }
+    result.advanced += assignMail(deps, {
+      gmailId: item.gmailId,
+      threadId: item.threadId,
+      from: item.from,
+      subject: item.subject,
+      kind: item.kind,
+      scoutId: decision.scoutId,
+      method: decision.method,
+    });
   }
 }
 
-function stageForMail(kind: MailKind): FunnelStage | null {
-  switch (kind) {
-    case "notice":
-      return "applied";
-    case "message_copy":
-    case "landlord":
-      return "in_conversation";
-    case "unclassified":
-      return null;
-  }
+function signalsFor(
+  deps: SyncDependencies,
+  candidates: readonly MailCandidate[],
+  item: {
+    from: string;
+    subject: string;
+    cleanText: string;
+    threadId: string;
+    inReplyTo: string;
+    references: string;
+  },
+) {
+  const parsed = parseScoutMail(item.from, item.subject, item.cleanText, "");
+  return {
+    exposeId: parsed.exposeId,
+    threadScoutId: deps.mail.scoutIdForThread(item.threadId) ?? "",
+    referencedScoutId:
+      deps.mail.scoutIdForMessageIds(referencedMessageIds(item.inReplyTo, item.references)) ?? "",
+    addressMatch: matchAddress(item.cleanText, candidates),
+  };
 }
 
 async function syncEvents(
@@ -227,19 +302,51 @@ function ingestEvent(deps: SyncDependencies, event: AgendaEvent, result: SyncRes
   }
 }
 
-async function readPending(deps: SyncDependencies, result: SyncResult): Promise<void> {
+async function readPending(deps: SyncDependencies, since: Date, result: SyncResult): Promise<void> {
   const pending = deps.mail.pendingWithoutReading();
   result.waiting = pending.length;
+  const candidates = deps.progress.openApplications(since);
   let reads = 0;
   for (const item of pending) {
-    const body = item.text.trim() !== "" ? item.text : item.html;
-    const open = item.scoutId ? deps.mail.openTopic(item.scoutId) : null;
-    const ruled = classifyReply(item.subject, body, open);
+    let current = item;
+    if (!current.scoutId && deps.resolver && candidates.length > 0 && reads < MAIL_READINGS_PER_RUN) {
+      if (reads > 0) {
+        await deps.clock.sleep(MAIL_READING_GAP_MS);
+      }
+      try {
+        const picked = await deps.resolver.resolve({
+          subject: current.subject,
+          body: current.cleanText,
+          candidates,
+        });
+        reads += 1;
+        if (picked && candidates.some((candidate) => candidate.scoutId === picked)) {
+          result.advanced += assignMail(deps, {
+            gmailId: current.gmailId,
+            threadId: current.threadId,
+            from: current.from,
+            subject: current.subject,
+            kind: current.kind,
+            scoutId: picked,
+            method: "model",
+          });
+          current = { ...current, scoutId: picked };
+        }
+      } catch (error) {
+        if (error instanceof MailReaderRateLimit) {
+          break;
+        }
+        reads += 1;
+      }
+    }
+    const body = current.cleanText;
+    const open = current.scoutId ? deps.mail.openTopic(current.scoutId) : null;
+    const ruled = classifyReply(current.subject, body, open);
     if (ruled) {
       await remember(
         deps,
         result,
-        item,
+        current,
         body,
         ruled,
         emptyProposal(),
@@ -254,17 +361,17 @@ async function readPending(deps: SyncDependencies, result: SyncResult): Promise<
       await deps.clock.sleep(MAIL_READING_GAP_MS);
     }
     try {
-      const raw = await deps.reader.propose(item.subject, body);
+      const raw = await deps.reader.propose(current.subject, body);
       const checked = validateCitation(body, raw.proposal);
-      const classification = settleReply(open, raw.intent, raw.evidence, item.subject, body);
+      const classification = settleReply(open, raw.intent, raw.evidence, current.subject, body);
       const visit = checked.proposal.visit ?? (classification.intent === "viewing_confirm" ? citedVisit(body) : null);
-      await remember(deps, result, item, body, classification, checked.proposal, visit);
+      await remember(deps, result, current, body, classification, checked.proposal, visit);
     } catch (error) {
       if (error instanceof MailReaderRateLimit) {
         break;
       }
       const message = error instanceof Error ? error.message : String(error);
-      deps.mail.insertReading(failedReading(deps, item.gmailId, JSON.stringify({ error: message })));
+      deps.mail.insertReading(failedReading(deps, current.gmailId, JSON.stringify({ error: message })));
     }
     reads += 1;
   }

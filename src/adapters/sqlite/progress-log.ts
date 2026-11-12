@@ -12,6 +12,7 @@ import { exposeUrl } from "../../domain/expose-url.js";
 import { gmailUrl } from "../../domain/gmail-url.js";
 import { gmailComposeUrl, mailboxAddress } from "../../domain/mail-reply.js";
 import { isListingStatus } from "../../domain/listing-status.js";
+import type { MailCandidate } from "../../domain/mail-link.js";
 import {
   advance,
   assertFunnelStage,
@@ -58,6 +59,10 @@ interface ApartmentSql {
   listing_status: string | null;
   energy_class: string | null;
   has_image: number | null;
+  snapshot: string | null;
+  refresh_state: string | null;
+  refresh_detail: string | null;
+  discovered_at: string | null;
 }
 
 interface MailSql {
@@ -71,6 +76,7 @@ interface MailSql {
   relation: string;
   body: string;
   alt_body: string;
+  clean_text: string;
 }
 
 interface ViewingSql {
@@ -168,20 +174,54 @@ export class SqliteProgressLog implements ProgressLog {
     }));
   }
 
+  openApplications(since: Date): MailCandidate[] {
+    const cutoff = since.toISOString();
+    const rows = this.db
+      .prepare(
+        `SELECT l.scout_id, l.title, l.address, l.price_cold
+         FROM progress p
+         JOIN listings l ON l.scout_id = p.scout_id
+         WHERE p.stage IN ('applied', 'in_conversation', 'viewing_offered', 'scheduled')
+           AND (
+             (l.applied_at IS NOT NULL AND l.applied_at >= ?)
+             OR p.updated_at >= ?
+           )`,
+      )
+      .all(cutoff, cutoff) as unknown as Array<{
+      scout_id: string;
+      title: string | null;
+      address: string | null;
+      price_cold: number | null;
+    }>;
+    return rows.map((row) => ({
+      scoutId: row.scout_id,
+      title: row.title,
+      address: row.address,
+      priceCold: row.price_cold,
+    }));
+  }
+
   listApartments(stage: FunnelStage): ApartmentCard[] {
     const energy = this.columnExists("listings", "energy_class");
     const image = this.columnExists("listings", "preview_image");
+    const snapshot = this.columnExists("listings", "snapshot");
+    const refresh = this.tableExists("expose_refresh");
     const rows = this.db
       .prepare(
         `SELECT p.scout_id, p.stage, l.title, l.url, l.address,
                 l.price_cold, l.price_warm, l.extra_costs, l.deposit, l.rooms, l.area_sqm,
                 l.floor, l.move_in, l.description, l.status AS listing_status,
                 ${energy ? "l.energy_class" : "NULL"} AS energy_class,
-                ${image ? "CASE WHEN l.preview_image IS NOT NULL THEN 1 ELSE 0 END" : "0"} AS has_image
+                ${image ? "CASE WHEN l.preview_image IS NOT NULL THEN 1 ELSE 0 END" : "0"} AS has_image,
+                ${snapshot ? "l.snapshot" : "NULL"} AS snapshot,
+                ${refresh ? "r.state" : "NULL"} AS refresh_state,
+                ${refresh ? "r.detail" : "NULL"} AS refresh_detail,
+                l.discovered_at
          FROM progress p
          LEFT JOIN listings l ON l.scout_id = p.scout_id
+         ${refresh ? "LEFT JOIN expose_refresh r ON r.scout_id = p.scout_id" : ""}
          WHERE p.stage = ?
-         ORDER BY p.updated_at DESC`,
+         ORDER BY l.discovered_at IS NULL, l.discovered_at DESC, p.scout_id DESC`,
       )
       .all(stage) as unknown as ApartmentSql[];
     const ids = rows.map((row) => row.scout_id);
@@ -194,7 +234,9 @@ export class SqliteProgressLog implements ProgressLog {
       stage: assertFunnelStage(row.stage),
       title: row.title,
       url: row.url ?? exposeUrl(row.scout_id),
-      opened: row.listing_status !== null && isListingStatus(row.listing_status) && row.listing_status !== "DISCOVERED",
+      opened:
+        (row.listing_status !== null && isListingStatus(row.listing_status) && row.listing_status !== "DISCOVERED") ||
+        Boolean(row.snapshot?.trim()),
       address: row.address,
       priceCold: row.price_cold,
       priceWarm: row.price_warm,
@@ -207,10 +249,49 @@ export class SqliteProgressLog implements ProgressLog {
       description: row.description,
       energyClass: row.energy_class,
       hasImage: Number(row.has_image) === 1,
+      refreshState: row.refresh_state === "queued" || row.refresh_state === "failed" ? row.refresh_state : null,
+      refreshDetail: row.refresh_detail || null,
+      discoveredAt: row.discovered_at ? new Date(row.discovered_at).toISOString() : null,
       topic: topics.get(row.scout_id) ?? null,
       mails: mails.get(row.scout_id) ?? [],
       viewings: viewings.get(row.scout_id) ?? [],
     }));
+  }
+
+  exposeFacts(scoutId: string): {
+    title: string | null;
+    address: string | null;
+    priceCold: number | null;
+    priceWarm: number | null;
+    rooms: number | null;
+    areaSqm: number | null;
+  } | null {
+    const row = this.db
+      .prepare(
+        `SELECT title, address, price_cold, price_warm, rooms, area_sqm
+         FROM listings WHERE scout_id = ?`,
+      )
+      .get(scoutId) as
+      | {
+          title: string | null;
+          address: string | null;
+          price_cold: number | null;
+          price_warm: number | null;
+          rooms: number | null;
+          area_sqm: number | null;
+        }
+      | undefined;
+    if (!row) {
+      return null;
+    }
+    return {
+      title: row.title,
+      address: row.address,
+      priceCold: row.price_cold,
+      priceWarm: row.price_warm,
+      rooms: row.rooms,
+      areaSqm: row.area_sqm,
+    };
   }
 
   readPreviewImage(scoutId: string): Uint8Array | null {
@@ -240,9 +321,11 @@ export class SqliteProgressLog implements ProgressLog {
     const placeholders = ids.map(() => "?").join(", ");
     const drafts = this.tableExists("reply_draft");
     const replyTo = this.columnExists("mail", "reply_to");
+    const clean = this.columnExists("mail", "clean_delta_text");
     const rows = this.db
       .prepare(
         `SELECT m.scout_id, m.gmail_id, m.from_addr, ${replyTo ? "m.reply_to" : "'' AS reply_to"}, m.subject, m.sent_at,
+                ${clean ? "m.clean_delta_text" : "''"} AS clean_text,
                 ${drafts ? "COALESCE(d.intent, '') AS intent, COALESCE(d.relation, '') AS relation, COALESCE(d.body, '') AS body, COALESCE(d.alt_body, '') AS alt_body" : "'' AS intent, '' AS relation, '' AS body, '' AS alt_body"}
          FROM mail m
          ${drafts ? "LEFT JOIN reply_draft d ON d.mail_id = m.gmail_id" : ""}
@@ -386,6 +469,7 @@ function toApartmentMail(row: MailSql, email: string | null): ApartmentMail {
     altDraft: row.alt_body,
     composeUrl: row.body ? gmailComposeUrl({ account: email, to, subject: row.subject, body: row.body }) : "",
     altComposeUrl: row.alt_body ? gmailComposeUrl({ account: email, to, subject: row.subject, body: row.alt_body }) : "",
+    cleanText: row.clean_text,
   };
 }
 

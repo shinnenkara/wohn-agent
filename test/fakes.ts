@@ -16,6 +16,7 @@ import type { FailureClassifier, FailureContext } from "../src/application/ports
 import type { ListingRepository } from "../src/application/ports/listing-repository.js";
 import type { Logger } from "../src/application/ports/logger.js";
 import type { Alert, Notifier } from "../src/application/ports/notifier.js";
+import type { ExposeRefreshQueue } from "../src/application/ports/expose-refresh.js";
 import type { ProgressLog, ProgressNote, ProgressTransitionRow, StageRow, ApartmentCard } from "../src/application/ports/progress-log.js";
 import type { SelectorCache } from "../src/application/ports/selector-cache.js";
 import { exposeUrl } from "../src/domain/expose-url.js";
@@ -23,6 +24,7 @@ import { advance, type FunnelStage } from "../src/domain/progress.js";
 import type { LoopDependencies } from "../src/application/run-agent-loop.js";
 import type { ApplicantProfile, ProfileField } from "../src/domain/applicant-profile.js";
 import { CaptchaEncountered, type CaptchaSignal } from "../src/domain/captcha-signal.js";
+import type { MailCandidate } from "../src/domain/mail-link.js";
 import { Listing } from "../src/domain/listing.js";
 import type { ListingStatus } from "../src/domain/listing-status.js";
 import type { AgentEvent } from "../src/domain/agent-event.js";
@@ -228,6 +230,10 @@ export class InMemoryProgress implements ProgressLog {
     return [...this.transitions];
   }
 
+  openApplications(): MailCandidate[] {
+    return [];
+  }
+
   listApartments(stage: FunnelStage): ApartmentCard[] {
     return this.listStages()
       .filter((row) => row.stage === stage)
@@ -249,10 +255,44 @@ export class InMemoryProgress implements ProgressLog {
         description: null,
         energyClass: null,
         hasImage: false,
+        refreshState: null,
+        refreshDetail: null,
+        discoveredAt: null,
         topic: null,
         mails: [],
         viewings: [],
       }));
+  }
+}
+
+export class InMemoryRefreshes implements ExposeRefreshQueue {
+  readonly queued: string[] = [];
+  readonly failed: Array<{ scoutId: string; detail: string }> = [];
+  readonly finished: string[] = [];
+
+  enqueue(scoutId: string, _at: Date): boolean {
+    this.queued.push(scoutId);
+    return true;
+  }
+
+  next(): string | null {
+    return this.queued[0] ?? null;
+  }
+
+  finish(scoutId: string): void {
+    this.finished.push(scoutId);
+    const index = this.queued.indexOf(scoutId);
+    if (index >= 0) {
+      this.queued.splice(index, 1);
+    }
+  }
+
+  fail(scoutId: string, detail: string): void {
+    this.failed.push({ scoutId, detail });
+    const index = this.queued.indexOf(scoutId);
+    if (index >= 0) {
+      this.queued.splice(index, 1);
+    }
   }
 }
 
@@ -481,6 +521,7 @@ export interface Harness {
   control: FakeControl;
   classifier: RecordingClassifier;
   browser: FakeBrowser;
+  refreshes: InMemoryRefreshes;
   profile: ApplicantProfile;
   loop: LoopDependencies;
   apply: ApplyDependencies;
@@ -498,6 +539,7 @@ export function createHarness(): Harness {
   const control = new FakeControl();
   const classifier = new RecordingClassifier();
   const browser = new FakeBrowser();
+  const refreshes = new InMemoryRefreshes();
   const profile = sampleProfile();
   const apply: ApplyDependencies = {
     browser,
@@ -529,6 +571,7 @@ export function createHarness(): Harness {
     profile,
     maxApplicationsPerCycle: 5,
     overnightRun: false,
+    refreshes,
   };
-  return { clock, logger, listings, selectors, events, progress, notifier, control, classifier, browser, profile, loop, apply, inspect };
+  return { clock, logger, listings, selectors, events, progress, notifier, control, classifier, browser, refreshes, profile, loop, apply, inspect };
 }

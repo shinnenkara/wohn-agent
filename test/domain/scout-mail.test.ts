@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { calendarNotice, fromScout, parseScoutMail } from "../../src/domain/scout-mail.js";
 import { validateCitation } from "../../src/domain/mail-citation.js";
+import { matchAddress } from "../../src/domain/mail-link.js";
+import { stripQuotedReply } from "../../src/domain/strip-reply.js";
 import { calendarTimeMax, gmailSearchQuery, parseSinceFlag } from "../../src/domain/google-window.js";
 import { scoutIdForEvent } from "../../src/domain/event-link.js";
 
@@ -36,6 +38,17 @@ describe("scout mail", () => {
     assert.equal(parsed.size, "27,8");
     assert.equal(parsed.rent, "774");
     assert.equal(parsed.title, "1-Zimmer-Apartment in Berlin Wedding - U-Bahn Pankstr.");
+  });
+
+  it("does not treat a saved search as an application notice", () => {
+    const parsed = parseScoutMail(
+      "ImmoScout24 <myscout@immobilienscout24.de>",
+      "Neuer Suchauftrag wurde angelegt",
+      "Link: https://www.immobilienscout24.de/expose/171641591",
+      "",
+    );
+    assert.equal(parsed.kind, "unclassified");
+    assert.equal(parsed.exposeId, "171641591");
   });
 
   it("keeps the reply rent and ignores the office postcode", () => {
@@ -84,7 +97,7 @@ describe("google windows", () => {
     const till = new Date("2026-10-07T00:00:00.000Z");
     assert.equal(
       gmailSearchQuery(since, till),
-      "after:2026/09/30 (from:immobilienscout24.de OR from:nachrichten.immobilienscout24.de) before:2026/10/08",
+      "after:2026/09/30 before:2026/10/08",
     );
     assert.equal(calendarTimeMax(till), "2026-10-08T00:00:00.000Z");
   });
@@ -141,6 +154,51 @@ describe("event links", () => {
         [visit, { ...visit, scoutId: "999999999" }],
       ),
       null,
+    );
+  });
+});
+
+describe("quoted replies", () => {
+  it("keeps the new sentence and drops the quoted document request", () => {
+    const plain = stripQuotedReply(
+      "Der Termin ist bestätigt.\n\nAm 11.11.2026 um 10:00 schrieb Vermieter:\nBitte senden Sie die SCHUFA und die Gehaltsnachweise.",
+      "",
+    );
+    assert.equal(plain, "Der Termin ist bestätigt.");
+    const html = stripQuotedReply(
+      "",
+      "<div>Der Termin ist bestätigt.</div><div class=\"gmail_quote\"><div>Am 11.11.2026 schrieb Vermieter:</div><blockquote>Bitte senden Sie die SCHUFA.</blockquote></div>",
+    );
+    assert.equal(html, "Der Termin ist bestätigt.");
+    const outlook = stripQuotedReply(
+      "",
+      "<div>Freitag passt.</div><div id=\"divRplyFwdMsg\">-----Original Message-----</div><div>Bitte senden Sie die SCHUFA.</div>",
+    );
+    assert.equal(outlook, "Freitag passt.");
+    const inline = stripQuotedReply("Ja.\n\n> alte Frage\n\nDie Miete ist 800 €.\n\n> noch älter", "");
+    assert.match(inline, /^Ja\./);
+    assert.match(inline, /Die Miete ist 800 €/);
+    assert.equal(inline.includes("alte Frage"), false);
+  });
+});
+
+describe("address matching", () => {
+  it("requires a street plus a zip or the cold rent, and refuses two hits", () => {
+    const one = matchAddress("Bitte kommen Sie in die Badstraße 54, 13357 Berlin.", [
+      { scoutId: "1", title: null, address: "Badstraße 54, 13357 Berlin", priceCold: 800 },
+      { scoutId: "2", title: null, address: "Hauptstraße 2, 10115 Berlin", priceCold: 900 },
+    ]);
+    assert.deepEqual(one, { scoutId: "1" });
+    assert.equal(matchAddress("Die Kaltmiete beträgt 800 €.", [
+      { scoutId: "1", title: null, address: "Badstraße 54, 13357 Berlin", priceCold: 800 },
+      { scoutId: "2", title: null, address: "Hauptstraße 2, 10115 Berlin", priceCold: 800 },
+    ]), null);
+    assert.equal(
+      matchAddress("Badstraße 54, 13357 Berlin, 800 €", [
+        { scoutId: "1", title: null, address: "Badstraße 54, 13357 Berlin", priceCold: 800 },
+        { scoutId: "2", title: null, address: "Badstraße 10, 13357 Berlin", priceCold: 800 },
+      ]),
+      "ambiguous",
     );
   });
 });

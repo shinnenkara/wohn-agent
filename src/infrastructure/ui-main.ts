@@ -7,6 +7,9 @@ import { SqliteMailStore } from "../adapters/sqlite/mail-store.js";
 import { SqliteProgressLog } from "../adapters/sqlite/progress-log.js";
 import { buildFlow } from "../domain/funnel.js";
 import { isFunnelStage } from "../domain/progress.js";
+import { linkUnlinkedMail } from "./link-route.js";
+import { queueExposeRefresh } from "./refresh-route.js";
+import { repairStoredAddresses } from "./repair-addresses.js";
 import { progressPage } from "./ui-page.js";
 
 const PORT = 8787;
@@ -19,6 +22,7 @@ function main(): void {
     process.exitCode = 1;
     return;
   }
+  correctStoredAddresses(databasePath);
   const db = openReadOnlyDatabase(databasePath);
   if (!hasProgressTable(db)) {
     db.close();
@@ -31,15 +35,13 @@ function main(): void {
   const progress = new SqliteProgressLog(db);
   const mail = new SqliteMailStore(db);
   const server = createServer((request, response) => {
-    try {
-      route(request, response, progress, mail);
-    } catch (error) {
+    void route(request, response, progress, mail, databasePath).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
       process.stderr.write(`${message}\n`);
       if (!response.headersSent) {
         send(response, 500, "text/plain; charset=utf-8", "Could not read apartment progress.");
       }
-    }
+    });
   });
   server.listen(PORT, "127.0.0.1", () => {
     process.stdout.write(`Apartment progress at http://127.0.0.1:${PORT}\n`);
@@ -52,13 +54,22 @@ function main(): void {
   process.on("SIGTERM", stop);
 }
 
-function route(
+async function route(
   request: IncomingMessage,
   response: ServerResponse,
   progress: SqliteProgressLog,
   mail: SqliteMailStore,
-): void {
+  databasePath: string,
+): Promise<void> {
   const url = new URL(request.url ?? "/", "http://127.0.0.1");
+  if (request.method === "POST" && url.pathname === "/api/apartments/refresh") {
+    refreshApartment(response, progress, databasePath, url.searchParams.get("id") ?? "");
+    return;
+  }
+  if (request.method === "POST" && url.pathname === "/api/unlinked/link") {
+    await linkRequest(request, response, databasePath);
+    return;
+  }
   if (request.method !== "GET") {
     send(response, 405, "text/plain; charset=utf-8", "Method not allowed");
     return;
@@ -103,6 +114,63 @@ function route(
     return;
   }
   send(response, 404, "text/plain; charset=utf-8", "Not found");
+}
+
+async function linkRequest(request: IncomingMessage, response: ServerResponse, databasePath: string): Promise<void> {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(await readBody(request));
+  } catch {
+    send(response, 400, "text/plain; charset=utf-8", "Unknown mail");
+    return;
+  }
+  const record = payload !== null && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
+  const gmailId = typeof record.gmailId === "string" ? record.gmailId.trim() : "";
+  const scoutId = typeof record.scoutId === "string" ? record.scoutId.trim() : "";
+  const result = linkUnlinkedMail(databasePath, gmailId, scoutId, new Date());
+  send(response, result.status, result.type, result.body);
+}
+
+function readBody(request: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    request.on("data", (chunk: Buffer | string) => {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += buffer.length;
+      if (size > 8192) {
+        reject(new Error("body too large"));
+        request.destroy();
+        return;
+      }
+      chunks.push(buffer);
+    });
+    request.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    request.on("error", reject);
+  });
+}
+
+function refreshApartment(
+  response: ServerResponse,
+  progress: SqliteProgressLog,
+  databasePath: string,
+  id: string,
+): void {
+  const result = queueExposeRefresh(progress, databasePath, id, new Date());
+  send(response, result.status, result.type, result.body);
+}
+
+function correctStoredAddresses(databasePath: string): void {
+  try {
+    const count = repairStoredAddresses(databasePath);
+    if (count > 0) {
+      const label = count === 1 ? "address" : "addresses";
+      process.stdout.write(`Corrected ${count} apartment ${label}.\n`);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`Could not correct stored addresses: ${message}\n`);
+  }
 }
 
 function hasProgressTable(db: DatabaseSync): boolean {

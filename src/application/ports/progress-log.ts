@@ -1,3 +1,4 @@
+import type { MailCandidate } from "../../domain/mail-link.js";
 import type { FunnelStage, ProgressSource } from "../../domain/progress.js";
 
 export interface ProgressNote {
@@ -34,6 +35,7 @@ export interface ApartmentMail {
   altDraft: string;
   composeUrl: string;
   altComposeUrl: string;
+  cleanText: string;
 }
 
 export interface ApartmentTopic {
@@ -67,6 +69,9 @@ export interface ApartmentCard {
   description: string | null;
   energyClass: string | null;
   hasImage: boolean;
+  refreshState: "queued" | "failed" | null;
+  refreshDetail: string | null;
+  discoveredAt: string | null;
   topic: ApartmentTopic | null;
   mails: ApartmentMail[];
   viewings: ApartmentViewing[];
@@ -79,4 +84,5 @@ export interface ProgressLog {
   listStages(): StageRow[];
   listTransitions(): ProgressTransitionRow[];
   listApartments(stage: FunnelStage): ApartmentCard[];
+  openApplications(since: Date): MailCandidate[];
 }

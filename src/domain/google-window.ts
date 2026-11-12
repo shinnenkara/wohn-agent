@@ -46,7 +46,7 @@ function parseSinceDate(value: string): Date {
 
 export function gmailSearchQuery(since: Date, till: Date | null): string {
   const after = addUtcDays(utcDay(since), -1);
-  let query = `after:${slashDate(after)} (from:immobilienscout24.de OR from:nachrichten.immobilienscout24.de)`;
+  let query = `after:${slashDate(after)}`;
   if (till) {
     const before = addUtcDays(utcDay(till), 1);
     query += ` before:${slashDate(before)}`;

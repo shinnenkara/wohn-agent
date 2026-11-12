@@ -29,6 +29,7 @@ interface ListingRow {
   retry_count: number | null;
   discovered_at: string;
   applied_at: string | null;
+  sent_message: string | null;
 }
 
 export class SqliteListingRepository implements ListingRepository {
@@ -61,8 +62,8 @@ export class SqliteListingRepository implements ListingRepository {
         scout_id, url, title, salutation, price_cold, rooms, area_sqm, address, price_warm,
         extra_costs, deposit, floor, move_in, description, snapshot, is_plus_only,
         status, filter_reason, error_code, retry_count, discovered_at, applied_at,
-        energy_class, preview_image
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        energy_class, preview_image, sent_message
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     this.db.exec("BEGIN");
     try {
@@ -122,8 +123,8 @@ export class SqliteListingRepository implements ListingRepository {
           scout_id, url, title, salutation, price_cold, rooms, area_sqm, address, price_warm,
           extra_costs, deposit, floor, move_in, description, snapshot, is_plus_only,
           status, filter_reason, error_code, retry_count, discovered_at, applied_at,
-          energy_class, preview_image
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          energy_class, preview_image, sent_message
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(scout_id) DO UPDATE SET
           url = excluded.url,
           title = excluded.title,
@@ -147,7 +148,8 @@ export class SqliteListingRepository implements ListingRepository {
           discovered_at = excluded.discovered_at,
           applied_at = excluded.applied_at,
           energy_class = excluded.energy_class,
-          preview_image = excluded.preview_image
+          preview_image = excluded.preview_image,
+          sent_message = excluded.sent_message
       `)
       .run(...bindListing(listing.toData()));
   }
@@ -195,6 +197,7 @@ function bindListing(data: ListingData): Array<string | number | null | Uint8Arr
     data.appliedAt ? data.appliedAt.toISOString() : null,
     data.energyClass,
     data.previewImage,
+    data.sentMessage,
   ];
 }
 
@@ -227,6 +230,7 @@ function toListing(row: ListingRow): Listing {
     retryCount: row.retry_count ?? 0,
     discoveredAt: new Date(row.discovered_at),
     appliedAt: row.applied_at ? new Date(row.applied_at) : null,
+    sentMessage: row.sent_message ?? "",
   });
 }
 

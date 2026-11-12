@@ -5,6 +5,7 @@ export interface RawExpose {
   contactName: string | null;
   description: string;
   bodyText: string;
+  addressText?: string | null;
   hasMessageButton: boolean;
   hasExternalLink: boolean;
   hasPhoneOnly: boolean;
@@ -53,7 +54,7 @@ export function interpretExpose(raw: RawExpose): ExposeFacts {
     areaSqm: areaFrom(body),
     floor: textAfter(body, ["Etage", "Geschoss"]),
     moveIn: textAfter(body, ["Bezugsfrei ab", "Bezugsfrei", "Verfügbar ab", "Verfuegbar ab"]),
-    address: addressFrom(body),
+    address: addressFrom(body, raw.addressText),
     snapshot: body.slice(0, SNAPSHOT_LIMIT),
     isPlusOnly: /nur mit mieter\s*plus|exklusiv für mieter\s*plus|exklusiv fuer mieter\s*plus/i.test(body),
     externalPortal: !raw.hasMessageButton && (raw.hasExternalLink || raw.hasPhoneOnly),
@@ -95,18 +96,81 @@ function moneyAfter(body: string, labels: readonly string[]): number | null {
   return value;
 }
 
-function addressFrom(body: string): string | null {
-  const labeled = textAfter(body, ["Adresse", "Anschrift"]);
-  if (labeled && !/invaliden/i.test(labeled)) {
-    return labeled;
+const STREET = /str\.|straße|strasse|allee|\b(?:weg|platz|damm|ufer|ring|gasse|chaussee)\b/i;
+const PLACE = String.raw`\p{L}[\p{L}.'’\-]*(?:\s+\p{L}[\p{L}.'’\-]*){0,3}`;
+const CITY = new RegExp(String.raw`^\d{5}\s+${PLACE}$`, "u");
+const DISTRICT = new RegExp(String.raw`^${PLACE},\s*\d{5}\s+${PLACE}$`, "u");
+const QUARTER = new RegExp(String.raw`^${PLACE},\s*${PLACE}$`, "u");
+
+export function looksLikeAddress(line: string): boolean {
+  return addressKind(line) !== null;
+}
+
+export function addressFrom(body: string, explicit?: string | null): string | null {
+  const fromElement = bestAddress(explicit ?? "", true);
+  if (fromElement) {
+    return fromElement;
   }
-  const lines = body.split(/\r?\n/).map((line) => line.trim());
-  for (const line of lines) {
-    if (/\b\d{5}\s+Berlin\b/.test(line) && !/invaliden/i.test(line) && line.length <= 160) {
-      return line;
+  const labeled = textAfter(body, ["Adresse", "Anschrift"]);
+  if (labeled && looksLikeAddress(labeled)) {
+    return clip(labeled);
+  }
+  return bestAddress(body, false);
+}
+
+function bestAddress(text: string, allowStreet: boolean): string | null {
+  let best: string | null = null;
+  let bestRank = 4;
+  for (const line of text.split(/\r?\n/)) {
+    const rank = addressRank(line, allowStreet);
+    if (rank < bestRank) {
+      best = line;
+      bestRank = rank;
     }
   }
+  return best ? clip(best) : null;
+}
+
+function addressRank(line: string, allowStreet: boolean): number {
+  const kind = addressKind(line);
+  if (kind === "postcode") {
+    const text = line.replace(/\s+/g, " ").trim();
+    if (STREET.test(text)) {
+      return 0;
+    }
+    if (DISTRICT.test(text)) {
+      return 1;
+    }
+    return 2;
+  }
+  if (kind === "place") {
+    return 3;
+  }
+  if (kind === "street" && allowStreet) {
+    return 4;
+  }
+  return 5;
+}
+
+function addressKind(line: string): "postcode" | "place" | "street" | null {
+  const text = line.replace(/\s+/g, " ").trim();
+  if (text.length < 6 || text.length > 200 || /invaliden/i.test(text) || /€|m²|\bzi\b|\bzimmer\b/i.test(text)) {
+    return null;
+  }
+  if (CITY.test(text) || DISTRICT.test(text) || (STREET.test(text) && /\b\d{5}\b/.test(text))) {
+    return "postcode";
+  }
+  if (QUARTER.test(text)) {
+    return "place";
+  }
+  if (STREET.test(text)) {
+    return "street";
+  }
   return null;
+}
+
+function clip(line: string): string {
+  return line.replace(/\s+/g, " ").trim().slice(0, 200);
 }
 
 function textAfter(body: string, labels: readonly string[]): string | null {

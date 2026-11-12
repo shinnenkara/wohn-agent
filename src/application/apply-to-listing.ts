@@ -127,10 +127,10 @@ export async function applyToListing(
         }
         throw new StepFailure("SUBMIT", "Confirmation was not observed", { name: "ConfirmationTimeout" });
       }
-      return await finishApplied(deps, current);
+      return await finishApplied(deps, current, message);
     } catch (error) {
       if (error instanceof ApplicationSent) {
-        return await finishApplied(deps, current);
+        return await finishApplied(deps, current, message);
       }
       if (error instanceof CaptchaEncountered) {
         throw requeueForCaptcha(deps, current, error);
@@ -268,17 +268,18 @@ async function heal(
   return { result: null, listing: released };
 }
 
-async function finishApplied(deps: ApplyDependencies, current: Listing): Promise<ApplyResult> {
+async function finishApplied(deps: ApplyDependencies, current: Listing, message: string): Promise<ApplyResult> {
   const applied = current.status === "APPLYING" ? current.markApplied(deps.clock.now()) : current;
-  persistListing(deps, applied);
-  deps.logger.info("application sent", { scoutId: applied.scoutId, title: applied.title ?? applied.scoutId });
+  const recorded = message.trim() ? applied.withSentMessage(message) : applied;
+  persistListing(deps, recorded);
+  deps.logger.info("application sent", { scoutId: recorded.scoutId, title: recorded.title ?? recorded.scoutId });
   await notifySafely(deps.notifier, deps.logger, {
     type: "APPLIED",
-    scoutId: applied.scoutId,
-    title: applied.title ?? applied.scoutId,
-    url: applied.url,
+    scoutId: recorded.scoutId,
+    title: recorded.title ?? recorded.scoutId,
+    url: recorded.url,
   });
-  return { kind: "applied", listing: applied };
+  return { kind: "applied", listing: recorded };
 }
 
 function finishFailed(deps: ApplyDependencies, current: Listing, errorCode: string): ApplyResult {

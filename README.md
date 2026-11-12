@@ -4,7 +4,7 @@ Local ImmoScout24 auto-apply loop. It attaches to a headed Chrome window you alr
 
 The domain and use cases own listing status, blacklist filtering, recovery limits, and the captcha circuit breaker. Stagehand, SQLite, and the shared notify service sit behind those ports. Applicant values are passed to Stagehand as variables and the message is filled locally, so they are not placed in observe instructions.
 
-The module map is in [docs/architecture.md](docs/architecture.md).
+The module map is in [docs/architecture.md](docs/architecture.md). The operator-visible order of a run is in [docs/flows.md](docs/flows.md).
 
 ## Run
 

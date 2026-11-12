@@ -12,7 +12,7 @@ export function openDatabase(path: string): DatabaseSync {
     db.exec("PRAGMA journal_mode = WAL");
   }
   db.exec("PRAGMA busy_timeout = 5000");
-  db.exec(loadSchemaSql());
+  applySchema(db);
   ensureListingColumns(db);
   ensureMailColumns(db);
   return db;
@@ -25,13 +25,28 @@ export function openReadOnlyDatabase(path: string): DatabaseSync {
   return db;
 }
 
-function loadSchemaSql(): string {
+function applySchema(db: DatabaseSync): void {
   const dir = fileURLToPath(new URL("./migrations/", import.meta.url));
-  return readdirSync(dir)
+  const files = readdirSync(dir)
     .filter((name) => name.endsWith(".sql"))
-    .sort()
-    .map((name) => readFileSync(join(dir, name), "utf8"))
-    .join("\n");
+    .sort();
+  for (const name of files) {
+    const sql = readFileSync(join(dir, name), "utf8");
+    for (const statement of sql.split(";")) {
+      const trimmed = statement.trim();
+      if (!trimmed) {
+        continue;
+      }
+      try {
+        db.exec(trimmed);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes("duplicate column name")) {
+          throw error;
+        }
+      }
+    }
+  }
 }
 
 const LISTING_COLUMNS: ReadonlyArray<readonly [string, string]> = [
@@ -45,11 +60,16 @@ const LISTING_COLUMNS: ReadonlyArray<readonly [string, string]> = [
   ["snapshot", "TEXT"],
   ["energy_class", "TEXT"],
   ["preview_image", "BLOB"],
+  ["sent_message", "TEXT NOT NULL DEFAULT ''"],
 ];
 
 const MAIL_COLUMNS: ReadonlyArray<readonly [string, string]> = [
   ["message_id", "TEXT NOT NULL DEFAULT ''"],
   ["reply_to", "TEXT NOT NULL DEFAULT ''"],
+  ["clean_delta_text", "TEXT NOT NULL DEFAULT ''"],
+  ["in_reply_to", "TEXT NOT NULL DEFAULT ''"],
+  ["references_header", "TEXT NOT NULL DEFAULT ''"],
+  ["link_method", "TEXT NOT NULL DEFAULT ''"],
 ];
 
 function ensureMailColumns(db: DatabaseSync): void {

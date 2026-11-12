@@ -74,6 +74,9 @@ export function progressPage(): string {
   .card { border: 1px solid var(--border); background: var(--card); border-radius: 8px; padding: 12px 14px; }
   .card h3 { margin: 0 0 6px; font-size: 1rem; }
   .card .preview { display: block; width: 100%; max-height: 180px; object-fit: cover; border-radius: 6px; margin: 0 0 8px; }
+  .card button, .link-mail button { font: inherit; background: transparent; color: var(--foreground); border: 1px solid var(--border); padding: 6px 12px; cursor: pointer; border-radius: 6px; }
+  .link-mail { display: flex; gap: 8px; align-items: center; margin: 6px 0 12px; flex-wrap: wrap; }
+  .link-mail input { font: inherit; background: var(--background); color: var(--foreground); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; }
   .card p, .card ul { margin: 0 0 8px; }
   .muted, .card .muted { color: var(--muted); }
   a { color: var(--foreground); }
@@ -110,6 +113,7 @@ export function progressPage(): string {
 </div>
 <script>
 var pinned = "";
+var shown = "";
 var flow = { nodes: [], links: [] };
 var columns = {
   discovered: 0,
@@ -134,6 +138,8 @@ function load() {
     drawTable(data);
   });
   fetch("/api/unlinked").then(function (response) { return response.json(); }).then(drawUnlinked);
+  document.getElementById("apartments").addEventListener("click", readExpose);
+  document.getElementById("unlinked").addEventListener("submit", linkMail);
 }
 
 function toggleTheme() {
@@ -265,7 +271,7 @@ function drawUnlinked(data) {
   var list = document.getElementById("unlinked");
   var items = [];
   (data.mail || []).forEach(function (mail) {
-    items.push(mailItem(mail));
+    items.push(mailItem(mail, true));
   });
   (data.events || []).forEach(function (event) {
     items.push("<li>" + escapeHtml(event.title) + " <span class='muted'>" + escapeHtml(event.place || "") + " " + escapeHtml(event.start) + "</span></li>");
@@ -274,6 +280,7 @@ function drawUnlinked(data) {
 }
 
 function showApartments(stage) {
+  shown = stage;
   fetch("/api/apartments?stage=" + encodeURIComponent(stage)).then(function (response) { return response.json(); }).then(function (rows) {
     var list = document.getElementById("apartments");
     if (!rows.length) {
@@ -297,22 +304,49 @@ function renderCard(row) {
     row.moveIn ? "from " + row.moveIn : "",
     row.energyClass ? "energy " + row.energyClass : ""
   ].filter(Boolean).join(" · ");
-  var mails = (row.mails || []).map(mailItem).join("");
+  var empty = !row.title && !row.address && !row.priceCold && !row.priceWarm && !row.rooms && !row.areaSqm;
+  var refresh = "";
+  if (empty && row.refreshState === "queued") {
+    refresh = "<p class='muted'>Waiting to read the expose.</p>";
+  } else if (empty) {
+    var failed = row.refreshState === "failed" && row.refreshDetail ? "<p class='muted'>" + escapeHtml(row.refreshDetail) + "</p>" : "";
+    refresh = failed + "<p><button type='button' class='read-expose' data-scout='" + escapeHtml(row.scoutId) + "'>Read expose</button></p>";
+  }
+  var mails = (row.mails || []).map(function (mail) { return mailItem(mail, false); }).join("");
   var viewings = (row.viewings || []).map(function (event) {
     return "<li>" + escapeHtml(event.title || "Viewing") + " <span class='muted'>" + escapeHtml(event.place || "") + " " + escapeHtml(event.start) + "</span></li>";
   }).join("");
   return "<article class='card'>" +
     (row.hasImage ? "<img class='preview' alt='' src='/api/apartments/image?id=" + encodeURIComponent(row.scoutId) + "'>" : "") +
     "<h3>" + escapeHtml(title) + "</h3>" +
+    seenLine(row.discoveredAt) +
     (row.address ? "<p>" + escapeHtml(row.address) + "</p>" : "") +
     (facts ? "<p>" + escapeHtml(facts) + "</p>" : "") +
     (row.description ? "<p class='muted'>" + escapeHtml(row.description) + "</p>" : "") +
     (row.opened ? "" : "<p class='muted'>The expose was not opened.</p>") +
+    refresh +
     topicLine(row.topic) +
     "<p><a href='" + escapeHtml(row.url) + "' target='_blank' rel='noreferrer'>See source</a></p>" +
     (mails ? "<ul>" + mails + "</ul>" : "") +
     (viewings ? "<ul>" + viewings + "</ul>" : "") +
     "</article>";
+}
+
+function readExpose(event) {
+  var button = event.target.closest ? event.target.closest("button.read-expose") : null;
+  if (!button) return;
+  button.disabled = true;
+  var id = button.getAttribute("data-scout") || "";
+  fetch("/api/apartments/refresh?id=" + encodeURIComponent(id), { method: "POST" }).then(function (response) {
+    if (response.ok) {
+      if (shown) showApartments(shown);
+      return;
+    }
+    return response.text().then(function (text) {
+      button.disabled = false;
+      button.insertAdjacentHTML("afterend", "<p class='muted'>" + escapeHtml(text) + "</p>");
+    });
+  });
 }
 
 function topicLine(topic) {
@@ -324,14 +358,89 @@ function topicLine(topic) {
   return "<p class='muted'>" + escapeHtml(name) + " · " + count + (count === 1 ? " mail · " : " mails · ") + state + "</p>";
 }
 
-function mailItem(mail) {
+function mailItem(mail, linkable) {
   var tag = [mail.relation || "", mail.intent || ""].filter(Boolean).join(" · ");
+  var clean = !linkable && mail.cleanText ? "<p>" + escapeHtml(mail.cleanText) + "</p>" : "";
   var draft = mail.draft ? "<p class='draft'>" + escapeHtml(mail.draft) + "</p>" : "";
   var alt = mail.altDraft ? "<p class='draft'>" + escapeHtml(mail.altDraft) + "</p>" : "";
   var compose = mail.composeUrl ? "<p><a href='" + escapeHtml(mail.composeUrl) + "' target='_blank' rel='noreferrer'>Open reply in Gmail</a></p>" : "";
   var other = mail.altComposeUrl ? "<p><a href='" + escapeHtml(mail.altComposeUrl) + "' target='_blank' rel='noreferrer'>Other reply in Gmail</a></p>" : "";
+  var form = linkable ? "<form class='link-mail' data-id='" + escapeHtml(mail.id) + "'><input name='scoutId' placeholder='Scout id' aria-label='Scout id'><button type='submit'>Link</button></form>" : "";
   return "<li><a href='" + escapeHtml(mail.url) + "' target='_blank' rel='noreferrer'>" + escapeHtml(mail.subject) + "</a> <span class='muted'>" + escapeHtml(mail.from) + " · " + escapeHtml(mail.sentAt) + "</span>" +
-    (tag ? "<div class='muted'>" + escapeHtml(tag) + "</div>" : "") + draft + compose + alt + other + "</li>";
+    (tag ? "<div class='muted'>" + escapeHtml(tag) + "</div>" : "") + clean + draft + compose + alt + other + form + "</li>";
+}
+
+function linkMail(event) {
+  var form = event.target;
+  if (!form || !form.classList || !form.classList.contains("link-mail")) return;
+  event.preventDefault();
+  var previous = form.querySelector(".link-note");
+  if (previous) previous.remove();
+  fetch("/api/unlinked/link", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ gmailId: form.getAttribute("data-id"), scoutId: form.scoutId.value.trim() })
+  }).then(function (response) {
+    if (!response.ok) {
+      return response.text().then(function (text) {
+        var note = document.createElement("p");
+        note.className = "muted link-note";
+        note.textContent = text;
+        form.appendChild(note);
+      });
+    }
+    return fetch("/api/flow").then(function (next) { return next.json(); }).then(function (data) {
+      flow = data;
+      draw(data);
+      drawTable(data);
+      if (shown) showApartments(shown);
+      return fetch("/api/unlinked").then(function (unlinked) { return unlinked.json(); }).then(drawUnlinked);
+    });
+  });
+}
+
+function seenLine(iso) {
+  if (!iso) return "";
+  var date = new Date(iso);
+  if (isNaN(date.getTime())) return "";
+  var shown = berlinClock(date);
+  var today = berlinClock(new Date());
+  var time = pad(shown.hour) + ":" + pad(shown.minute);
+  var label = time;
+  if (shown.year !== today.year || shown.month !== today.month || shown.day !== today.day) {
+    label = shown.day + "." + shown.month + ".";
+    if (shown.year !== today.year) label += shown.year;
+    label += ", " + time;
+  }
+  var full = date.toLocaleString("de-DE", { timeZone: "Europe/Berlin" });
+  return "<p class='muted' title='" + escapeHtml(full) + "'>Seen " + escapeHtml(label) + "</p>";
+}
+
+function berlinClock(date) {
+  var values = {};
+  new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/Berlin",
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(date).forEach(function (part) {
+    if (part.type !== "literal") values[part.type] = part.value;
+  });
+  var hour = Number(values.hour);
+  return {
+    year: Number(values.year),
+    month: Number(values.month),
+    day: Number(values.day),
+    hour: hour === 24 ? 0 : hour,
+    minute: Number(values.minute)
+  };
+}
+
+function pad(value) {
+  return value < 10 ? "0" + value : String(value);
 }
 
 function trimNumber(value) {

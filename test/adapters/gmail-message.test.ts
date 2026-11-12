@@ -13,6 +13,8 @@ describe("gmail message", () => {
           { name: "From", value: "ImmoScout24 <myscout@immobilienscout24.de>" },
           { name: "Reply-To", value: "Reply <back@example.com>" },
           { name: "Message-ID", value: "<m1@example.com>" },
+          { name: "In-Reply-To", value: "<parent@example.com>" },
+          { name: "References", value: "<root@example.com> <parent@example.com>" },
           { name: "Subject", value: "Anfrage versendet" },
         ],
         parts: [
@@ -26,6 +28,8 @@ describe("gmail message", () => {
     assert.equal(parsed.from.includes("myscout@"), true);
     assert.equal(parsed.replyTo, "Reply <back@example.com>");
     assert.equal(parsed.messageId, "<m1@example.com>");
+    assert.equal(parsed.inReplyTo, "<parent@example.com>");
+    assert.equal(parsed.references, "<root@example.com> <parent@example.com>");
     assert.equal(parsed.sentAt, new Date(1760000000000).toISOString());
   });
 });

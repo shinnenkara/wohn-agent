@@ -10,7 +10,7 @@ import { SqliteEventLog } from "../../src/adapters/sqlite/event-log.js";
 import { SqliteListingRepository } from "../../src/adapters/sqlite/listing-repository.js";
 import { SqliteSelectorCache } from "../../src/adapters/sqlite/selector-cache-repository.js";
 import { classifyByRules } from "../../src/adapters/stagehand/classify-by-rules.js";
-import { interpretExpose, parseGermanAmount, uniqueScoutIds } from "../../src/adapters/stagehand/parse-listing-text.js";
+import { interpretExpose, looksLikeAddress, parseGermanAmount, uniqueScoutIds } from "../../src/adapters/stagehand/parse-listing-text.js";
 import { interpretSearchCard, readThumbnail, thumbnailUrl } from "../../src/adapters/stagehand/parse-search-card.js";
 import { isSubmitLabel, pickOpenerIndex } from "../../src/adapters/stagehand/contact-opener.js";
 import { namedFillPlan } from "../../src/adapters/stagehand/named-fields.js";
@@ -51,6 +51,17 @@ describe("sqlite repositories", () => {
       assert.equal(listings.resetApplyingToDiscovered(), 1);
       assert.equal(listings.findById(discovered.scoutId)?.status, "DISCOVERED");
       assert.equal(listings.findById(discovered.scoutId)?.retryCount, 0);
+      const sent = listings
+        .findById(discovered.scoutId)
+        ?.startApplying()
+        .markApplied(new Date("2026-11-04T12:00:00.000Z"))
+        .withSentMessage("Sehr geehrte Frau Müller");
+      if (!sent) {
+        throw new Error("missing listing");
+      }
+      listings.save(sent);
+      assert.equal(listings.findById(discovered.scoutId)?.sentMessage, "Sehr geehrte Frau Müller");
+      assert.equal(listings.findById(discovered.scoutId)?.status, "APPLIED");
 
       const cache = new SqliteSelectorCache(db);
       cache.upsert({
@@ -316,6 +327,51 @@ describe("listing text, profile, and alerts", () => {
     assert.equal(facts.address, "Badstr. 54, 13357 Berlin");
     assert.equal(facts.description, "Ruhige Wohnung.");
     assert.match(facts.snapshot, /Kaltmiete/);
+  });
+
+  it("keeps a district address and ignores the Adresse suchen button", () => {
+    const facts = interpretExpose({
+      title: "Wohnung in Grafenberg",
+      contactName: null,
+      description: "",
+      bodyText: ["Adresse suchen", "Kaltmiete", "900 €", "2 Zimmer"].join("\n"),
+      addressText: "Grafenberg, 40629 Düsseldorf",
+      hasMessageButton: true,
+      hasExternalLink: false,
+      hasPhoneOnly: false,
+    });
+    assert.equal(facts.address, "Grafenberg, 40629 Düsseldorf");
+
+    const fromBody = interpretExpose({
+      title: "Wohnung in Grafenberg",
+      contactName: null,
+      description: "",
+      bodyText: [
+        "Adresse suchen",
+        "Grafenberg, 40629 Düsseldorf",
+        "Invalidenstraße 65, 10557 Berlin",
+        "13357 Berlin",
+      ].join("\n"),
+      hasMessageButton: true,
+      hasExternalLink: false,
+      hasPhoneOnly: false,
+    });
+    assert.equal(fromBody.address, "Grafenberg, 40629 Düsseldorf");
+
+    const officeOnly = interpretExpose({
+      title: "Büro",
+      contactName: null,
+      description: "",
+      bodyText: "Adresse\nInvalidenstraße 65, 10557 Berlin",
+      hasMessageButton: true,
+      hasExternalLink: false,
+      hasPhoneOnly: false,
+    });
+    assert.equal(officeOnly.address, null);
+    assert.equal(looksLikeAddress("suchen"), false);
+    assert.equal(looksLikeAddress("Pempelfort, Düsseldorf"), true);
+    assert.equal(looksLikeAddress("Hansaallee 100, Oberkassel, Düsseldorf"), true);
+    assert.equal(looksLikeAddress("Sehr ruhiges 1,5-Raum-Appartement in Düsseldorf"), false);
   });
 
   it("loads the example profile and formats alerts without income", () => {
