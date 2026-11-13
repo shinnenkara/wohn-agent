@@ -111,6 +111,9 @@ async function syncMail(
 ): Promise<void> {
   let fetched: FetchedMail[] = [];
   let nextHistory = "";
+  const report = (line: string) => {
+    process.stderr.write(`${line}\n`);
+  };
   const candidates = deps.progress.openApplications(options.since);
   const take = async (mails: readonly FetchedMail[]) => {
     for (const item of mails) {
@@ -123,10 +126,14 @@ async function syncMail(
     }
     fetched = limited(await deps.mailbox.listSince(options.since, options.till), options.mailCap);
   } else if (!historyId) {
-    nextHistory = await deps.mailbox.historyId();
-    await deps.mailbox.listSince(options.since, null, { skip: deps.mail.storedGmailIds(), onBatch: take });
+    nextHistory = await deps.mailbox.historyId(report);
+    await deps.mailbox.listSince(options.since, null, {
+      skip: deps.mail.storedGmailIds(),
+      onBatch: take,
+      onProgress: report,
+    });
   } else {
-    const added = await deps.mailbox.addedSince(historyId);
+    const added = await deps.mailbox.addedSince(historyId, report);
     if (added.expired) {
       let fallback = options.since;
       const latest = deps.mail.latestSentAt();
@@ -136,8 +143,12 @@ async function syncMail(
           fallback = parsed;
         }
       }
-      nextHistory = await deps.mailbox.historyId();
-      await deps.mailbox.listSince(fallback, null, { skip: deps.mail.storedGmailIds(), onBatch: take });
+      nextHistory = await deps.mailbox.historyId(report);
+      await deps.mailbox.listSince(fallback, null, {
+        skip: deps.mail.storedGmailIds(),
+        onBatch: take,
+        onProgress: report,
+      });
     } else {
       fetched = added.mails;
       nextHistory = added.latestId;

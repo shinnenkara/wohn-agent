@@ -16,10 +16,11 @@ export interface FetchedMail {
 export interface MailListOptions {
   skip?: ReadonlySet<string>;
   onBatch?: (mails: readonly FetchedMail[]) => Promise<void>;
+  onProgress?: (line: string) => void;
 }
 
 export interface Mailbox {
-  historyId(): Promise<string>;
+  historyId(onProgress?: (line: string) => void): Promise<string>;
   listSince(since: Date, till: Date | null, options?: MailListOptions): Promise<FetchedMail[]>;
-  addedSince(startId: string): Promise<{ mails: FetchedMail[]; latestId: string; expired: boolean }>;
+  addedSince(startId: string, onProgress?: (line: string) => void): Promise<{ mails: FetchedMail[]; latestId: string; expired: boolean }>;
 }

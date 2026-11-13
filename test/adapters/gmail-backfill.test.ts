@@ -28,15 +28,25 @@ describe("gmail backfill", () => {
       },
     );
     const batches: string[][] = [];
+    const lines: string[] = [];
     const listed = await mailbox.listSince(new Date("2026-10-01T00:00:00.000Z"), null, {
       skip: new Set(["kept"]),
       onBatch: async (mails) => {
         batches.push(mails.map((mail) => mail.id));
       },
+      onProgress: (line) => {
+        lines.push(line);
+      },
     });
     assert.deepEqual(listed, []);
     assert.deepEqual(batches, [["fresh"]]);
     assert.deepEqual(waits, [60_000]);
+    assert.deepEqual(lines, [
+      "Listing Gmail messages since 2026-10-01.",
+      "Listed 2 messages. 1 already stored. 1 to download.",
+      "Gmail quota reached. Pausing 60s.",
+      "Stored 1 messages (1 of 1).",
+    ]);
   });
 });
 
