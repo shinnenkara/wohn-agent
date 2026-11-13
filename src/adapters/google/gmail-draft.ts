@@ -64,11 +64,61 @@ export function encodeReplyMime(draft: ReplyDraft): string {
     draft.inReplyTo.trim() ? `In-Reply-To: ${draft.inReplyTo.trim()}` : "",
     draft.references.trim() ? `References: ${draft.references.trim()}` : "",
     "MIME-Version: 1.0",
+  ].filter((line) => line !== "");
+  const raw = draft.attachment ? mixedMessage(headers, draft.body, draft.attachment) : plainMessage(headers, draft.body);
+  return Buffer.from(raw, "utf8").toString("base64url");
+}
+
+function plainMessage(headers: readonly string[], body: string): string {
+  return [...headers, "Content-Type: text/plain; charset=utf-8", "Content-Transfer-Encoding: base64", "", wrapBase64(bodyBytes(body))].join(
+    "\r\n",
+  );
+}
+
+function mixedMessage(headers: readonly string[], body: string, attachment: NonNullable<ReplyDraft["attachment"]>): string {
+  const boundary = `wohn_${Date.now().toString(16)}${Math.random().toString(16).slice(2)}`;
+  const filename = attachment.filename.replace(/[\r\n"]/g, "");
+  return [
+    ...headers,
+    `Content-Type: multipart/mixed; boundary="${boundary}"`,
+    "",
+    `--${boundary}`,
     "Content-Type: text/plain; charset=utf-8",
     "Content-Transfer-Encoding: base64",
-  ].filter((line) => line !== "");
-  const body = Buffer.from(draft.body, "utf8").toString("base64").replace(/(.{76})/g, "$1\r\n");
-  return Buffer.from(`${headers.join("\r\n")}\r\n\r\n${body}`, "utf8").toString("base64url");
+    "",
+    wrapBase64(bodyBytes(body)),
+    `--${boundary}`,
+    `Content-Type: application/pdf; name="${asciiFilename(filename)}"`,
+    contentDisposition(filename),
+    "Content-Transfer-Encoding: base64",
+    "",
+    wrapBase64(Buffer.from(attachment.content).toString("base64")),
+    `--${boundary}--`,
+  ].join("\r\n");
+}
+
+function bodyBytes(body: string): string {
+  return Buffer.from(body, "utf8").toString("base64");
+}
+
+function wrapBase64(value: string): string {
+  return value.replace(/(.{76})/g, "$1\r\n");
+}
+
+function asciiFilename(filename: string): string {
+  return filename
+    .replace(/ä/g, "ae")
+    .replace(/ö/g, "oe")
+    .replace(/ü/g, "ue")
+    .replace(/Ä/g, "Ae")
+    .replace(/Ö/g, "Oe")
+    .replace(/Ü/g, "Ue")
+    .replace(/ß/g, "ss")
+    .replace(/[^\w.\-]+/g, "_");
+}
+
+function contentDisposition(filename: string): string {
+  return `Content-Disposition: attachment; filename="${asciiFilename(filename)}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
 }
 
 function headerValue(value: string): string {

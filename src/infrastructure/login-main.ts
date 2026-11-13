@@ -104,6 +104,23 @@ async function readSession(
   return parsed.data;
 }
 
+export async function ensureStoredAccount(input: {
+  accounts: { load(): { email: string } | null; saveLogin(login: { email: string; connectedAt: Date }): void };
+  googleUrl: string;
+  deviceToken: string;
+  fetchImpl: typeof fetch;
+  now: Date;
+}): Promise<void> {
+  if (input.accounts.load()) {
+    return;
+  }
+  const session = await readSession(input.googleUrl, input.deviceToken, input.fetchImpl);
+  if (!session.linked) {
+    throw new Error("Google is not connected. Run npm run login.");
+  }
+  input.accounts.saveLogin({ email: session.email, connectedAt: input.now });
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

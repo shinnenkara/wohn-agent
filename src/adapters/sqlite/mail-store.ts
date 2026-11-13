@@ -4,6 +4,9 @@ import type {
   BusyInterval,
   LoadedTriage,
   MailReading,
+  NewJudgment,
+  StoredAppliedTriage,
+  StoredJudgment,
   MailStore,
   NewMailAction,
   OpenMailAction,
@@ -17,14 +20,17 @@ import type {
   StoredThreadMail,
   StoredVisit,
   UnlinkedEvent,
+  UnlinkedJudgment,
   UnlinkedMail,
   UnreadMail,
   UnresolvedMail,
+  DocumentSubmission,
 } from "../../application/ports/mail-store.js";
 import { storedTopic, visitFromPayload } from "../../application/ports/mail-store.js";
 import { normalizeSubject, senderDomain, type LinkMethod } from "../../domain/mail-link.js";
 import type { OpenTopic } from "../../domain/mail-reply.js";
 import type { MailKind } from "../../domain/scout-mail.js";
+import { judgmentCitation } from "../../domain/triage.js";
 import type { ActionStatus } from "../../domain/mail-action.js";
 import { gmailUrl } from "../../domain/gmail-url.js";
 
@@ -93,6 +99,11 @@ export class SqliteMailStore implements MailStore {
       | { sent_at: string | null }
       | undefined;
     return row?.sent_at ?? null;
+  }
+
+  storedGmailIds(): ReadonlySet<string> {
+    const rows = this.db.prepare("SELECT gmail_id FROM mail").all() as unknown as Array<{ gmail_id: string }>;
+    return new Set(rows.map((row) => row.gmail_id));
   }
 
   scoutIdForThread(threadId: string): string | null {
@@ -176,6 +187,11 @@ export class SqliteMailStore implements MailStore {
     const result = this.db
       .prepare("UPDATE mail SET scout_id = ?, link_method = ? WHERE gmail_id = ? AND scout_id = ''")
       .run(scoutId, method, gmailId);
+    if (Number(result.changes) > 0) {
+      this.db
+        .prepare("UPDATE model_judgment SET scout_id = ? WHERE mail_id = ? AND scout_id = ''")
+        .run(scoutId, gmailId);
+    }
     return Number(result.changes) > 0;
   }
 
@@ -224,7 +240,7 @@ export class SqliteMailStore implements MailStore {
       .prepare(
         `SELECT gmail_id, thread_id, from_addr, reply_to, subject, body_text, body_html, clean_delta_text, kind, scout_id FROM mail
          WHERE kind IN ('landlord', 'message_copy', 'unclassified')
-           AND gmail_id NOT IN (SELECT mail_id FROM reading)
+           AND gmail_id NOT IN (SELECT mail_id FROM reading WHERE status = 'proposed')
          ORDER BY CASE kind WHEN 'landlord' THEN 0 WHEN 'message_copy' THEN 1 ELSE 2 END, sent_at`,
       )
       .all() as unknown as MailRow[];
@@ -236,7 +252,7 @@ export class SqliteMailStore implements MailStore {
       .prepare(
         `SELECT gmail_id, thread_id, from_addr, reply_to, subject, body_text, body_html, clean_delta_text, kind, scout_id FROM mail
          WHERE kind IN ('landlord', 'message_copy', 'unclassified')
-           AND gmail_id NOT IN (SELECT mail_id FROM reading)
+           AND gmail_id NOT IN (SELECT mail_id FROM reading WHERE status = 'proposed')
            AND gmail_id NOT IN (SELECT mail_id FROM mail_risk)
          ORDER BY CASE kind WHEN 'landlord' THEN 0 WHEN 'message_copy' THEN 1 ELSE 2 END, sent_at`,
       )
@@ -252,10 +268,11 @@ export class SqliteMailStore implements MailStore {
        ) VALUES (?, ?, ?, ?, ?, ?)`,
     );
     const riskWrite = this.db.prepare(
-      `INSERT INTO mail_risk (mail_id, risk_level, red_flags_json) VALUES (?, ?, ?)
+      `INSERT INTO mail_risk (mail_id, risk_level, red_flags_json, relevance) VALUES (?, ?, ?, ?)
        ON CONFLICT(mail_id) DO UPDATE SET
          risk_level = excluded.risk_level,
-         red_flags_json = excluded.red_flags_json`,
+         red_flags_json = excluded.red_flags_json,
+         relevance = excluded.relevance`,
     );
     this.db.exec("BEGIN");
     try {
@@ -270,7 +287,7 @@ export class SqliteMailStore implements MailStore {
           intent.dskViolation ? 1 : 0,
         );
       }
-      riskWrite.run(mailId, risk.level, risk.redFlagsJson);
+      riskWrite.run(mailId, risk.level, risk.redFlagsJson, risk.relevance);
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -279,20 +296,62 @@ export class SqliteMailStore implements MailStore {
   }
 
   loadTriage(mailId: string): LoadedTriage | null {
-    const risk = this.db.prepare("SELECT risk_level, red_flags_json FROM mail_risk WHERE mail_id = ?").get(mailId) as
-      | { risk_level: string; red_flags_json: string }
-      | undefined;
+    const stored = this.loadStoredTriage(mailId);
+    if (!stored) {
+      return null;
+    }
+    return {
+      codes: stored.intents.map((intent) => intent.code).sort(),
+      riskLevel: stored.riskLevel,
+      flags: stored.redFlags,
+      relevance: stored.relevance,
+    };
+  }
+
+  loadStoredTriage(mailId: string): StoredAppliedTriage | null {
+    const risk = this.db
+      .prepare("SELECT risk_level, red_flags_json, relevance FROM mail_risk WHERE mail_id = ?")
+      .get(mailId) as { risk_level: string; red_flags_json: string; relevance: string } | undefined;
     if (!risk) {
       return null;
     }
     const rows = this.db
-      .prepare("SELECT intent_code FROM mail_extracted_intents WHERE mail_id = ? ORDER BY intent_code")
-      .all(mailId) as unknown as Array<{ intent_code: string }>;
+      .prepare(
+        `SELECT intent_code, confidence, summary, metadata_json, dsk_violation
+         FROM mail_extracted_intents WHERE mail_id = ? ORDER BY intent_code`,
+      )
+      .all(mailId) as unknown as Array<{
+      intent_code: string;
+      confidence: number;
+      summary: string;
+      metadata_json: string;
+      dsk_violation: number;
+    }>;
+    const draft = this.db.prepare("SELECT body FROM reply_draft WHERE mail_id = ?").get(mailId) as
+      | { body: string }
+      | undefined;
     return {
-      codes: rows.map((row) => row.intent_code),
+      intents: rows.map((row) => ({
+        code: row.intent_code,
+        confidence: row.confidence,
+        summary: row.summary,
+        metadataJson: row.metadata_json,
+        dskViolation: Number(row.dsk_violation) === 1,
+      })),
       riskLevel: risk.risk_level,
-      flags: parseFlags(risk.red_flags_json),
+      redFlags: parseFlags(risk.red_flags_json),
+      relevance: risk.relevance,
+      draftBody: draft?.body ?? "",
     };
+  }
+
+  attachActions(mailId: string, scoutId: string): void {
+    if (scoutId === "") {
+      return;
+    }
+    this.db
+      .prepare("UPDATE user_mail_actions SET scout_id = ? WHERE mail_id = ? AND scout_id = ''")
+      .run(scoutId, mailId);
   }
 
   private toUnread(row: MailRow): UnreadMail {
@@ -313,8 +372,8 @@ export class SqliteMailStore implements MailStore {
   insertDraft(draft: StoredDraft): void {
     this.db
       .prepare(
-        `INSERT OR REPLACE INTO reply_draft (mail_id, intent, relation, topic, body, alt_body, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT OR REPLACE INTO reply_draft (mail_id, intent, relation, topic, body, alt_body, other_body, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         draft.mailId,
@@ -323,6 +382,7 @@ export class SqliteMailStore implements MailStore {
         draft.topic,
         draft.body,
         draft.altBody,
+        draft.otherBody,
         draft.createdAt.toISOString(),
       );
   }
@@ -354,10 +414,47 @@ export class SqliteMailStore implements MailStore {
   insertReading(reading: MailReading): void {
     this.db
       .prepare(
-        `INSERT OR IGNORE INTO reading (mail_id, status, payload, model, created_at)
-         VALUES (?, ?, ?, ?, ?)`,
+        `INSERT INTO reading (mail_id, status, payload, model, created_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(mail_id) DO UPDATE SET
+           status = excluded.status,
+           payload = excluded.payload,
+           model = excluded.model,
+           created_at = excluded.created_at
+         WHERE reading.status = 'failed'`,
       )
       .run(reading.mailId, reading.status, reading.payload, reading.model, reading.createdAt.toISOString());
+  }
+
+  insertJudgment(judgment: NewJudgment): void {
+    this.db
+      .prepare(
+        `INSERT INTO model_judgment (
+           created_at, scout_id, mail_id, source, branch, model, stage, proposal_json, decision_json, error
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        judgment.createdAt.toISOString(),
+        judgment.scoutId,
+        judgment.mailId,
+        judgment.source,
+        judgment.branch,
+        judgment.model,
+        judgment.stage,
+        judgment.proposalJson,
+        judgment.decisionJson,
+        judgment.error,
+      );
+  }
+
+  judgmentsForMail(mailId: string): StoredJudgment[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, created_at, scout_id, mail_id, source, branch, model, stage, proposal_json, decision_json, error
+         FROM model_judgment WHERE mail_id = ? ORDER BY id`,
+      )
+      .all(mailId) as unknown as JudgmentRow[];
+    return rows.map(toJudgment);
   }
 
   insertEvent(event: StoredEvent, createdAt: Date): boolean {
@@ -377,6 +474,11 @@ export class SqliteMailStore implements MailStore {
         event.scoutId,
         createdAt.toISOString(),
       );
+    return Number(result.changes) > 0;
+  }
+
+  removeEvent(eventId: string): boolean {
+    const result = this.db.prepare("DELETE FROM calendar_event WHERE event_id = ?").run(eventId);
     return Number(result.changes) > 0;
   }
 
@@ -416,20 +518,33 @@ export class SqliteMailStore implements MailStore {
     return visits;
   }
 
-  listUnlinkedMail(limit: number): UnlinkedMail[] {
+  listUnlinkedMail(limit: number, includeHidden = false): UnlinkedMail[] {
     const rows = this.db
       .prepare(
-        `SELECT gmail_id, from_addr, subject, sent_at, clean_delta_text FROM mail
-         WHERE scout_id = '' ORDER BY sent_at DESC LIMIT ?`,
+        `SELECT m.gmail_id, m.from_addr, m.subject, m.sent_at, m.clean_delta_text,
+                COALESCE(m.operator_list, '') AS operator_list,
+                COALESCE(r.relevance, '') AS relevance
+         FROM mail m
+         LEFT JOIN mail_risk r ON r.mail_id = m.gmail_id
+         WHERE m.scout_id = ''
+           AND (
+             ? = 1
+             OR COALESCE(m.operator_list, '') = 'shown'
+             OR (COALESCE(m.operator_list, '') != 'hidden' AND COALESCE(r.relevance, '') != 'unrelated')
+           )
+         ORDER BY m.sent_at DESC LIMIT ?`,
       )
-      .all(limit) as unknown as Array<{
+      .all(includeHidden ? 1 : 0, limit) as unknown as Array<{
       gmail_id: string;
       from_addr: string;
       subject: string;
       sent_at: string;
       clean_delta_text: string;
+      operator_list: string;
+      relevance: string;
     }>;
     const email = accountEmail(this.db);
+    const judgments = judgmentsFor(this.db, rows.map((row) => row.gmail_id));
     return rows.map((row) => ({
       id: row.gmail_id,
       url: gmailUrl(row.gmail_id, email),
@@ -437,7 +552,18 @@ export class SqliteMailStore implements MailStore {
       subject: row.subject,
       sentAt: row.sent_at,
       cleanText: row.clean_delta_text,
+      relevance: row.relevance,
+      read: row.relevance !== "",
+      concealed: concealed(row.operator_list, row.relevance),
+      judgments: judgments.get(row.gmail_id) ?? [],
     }));
+  }
+
+  setOperatorList(gmailId: string, hidden: boolean): boolean {
+    const result = this.db
+      .prepare("UPDATE mail SET operator_list = ? WHERE gmail_id = ? AND scout_id = ''")
+      .run(hidden ? "hidden" : "shown", gmailId);
+    return Number(result.changes) > 0;
   }
 
   listUnlinkedEvents(limit: number): UnlinkedEvent[] {
@@ -559,12 +685,21 @@ export class SqliteMailStore implements MailStore {
                 a.action_url, a.draft_response_text, a.deadline_at, t.title_template,
                 m.subject, m.from_addr, m.body_text, m.clean_delta_text,
                 COALESCE(l.address, '') AS address,
-                COALESCE(i.metadata_json, '') AS metadata_json
+                COALESCE(i.metadata_json, '') AS metadata_json,
+                COALESCE(i.dsk_violation, 0) AS dsk_violation,
+                COALESCE(d.other_body, '') AS other_body,
+                COALESCE(d.alt_body, '') AS decline_body,
+                COALESCE(j.branch, '') AS judgment_branch,
+                COALESCE(j.decision_json, '') AS judgment_decision
          FROM user_mail_actions a
          JOIN action_templates t ON t.code = a.action_code
          JOIN mail m ON m.gmail_id = a.mail_id
          LEFT JOIN listings l ON l.scout_id = a.scout_id
          LEFT JOIN mail_extracted_intents i ON i.mail_id = a.mail_id AND i.intent_code = a.intent_code
+         LEFT JOIN reply_draft d ON d.mail_id = a.mail_id
+         LEFT JOIN model_judgment j ON j.mail_id = a.mail_id AND j.id = (
+           SELECT MAX(mj.id) FROM model_judgment mj WHERE mj.mail_id = a.mail_id
+         )
          WHERE a.status IN ('PENDING', 'NOTIFIED', 'IN_PROGRESS')
          ORDER BY a.id`,
       )
@@ -577,6 +712,12 @@ export class SqliteMailStore implements MailStore {
       address: row.address,
       body: `${row.clean_delta_text}\n${row.body_text}`,
       slotText: firstSlot(row.metadata_json),
+      requestedDocuments: requestedDocuments(row.metadata_json),
+      dskViolation: Number(row.dsk_violation) === 1,
+      otherBody: row.other_body,
+      declineBody: row.decline_body,
+      judgmentBranch: row.judgment_branch,
+      judgmentCitation: judgmentCitation(row.judgment_decision),
     }));
   }
 
@@ -611,6 +752,103 @@ export class SqliteMailStore implements MailStore {
       email: accountEmail(this.db),
     };
   }
+
+  recordSubmission(scoutId: string, mailId: string, at: Date): void {
+    if (scoutId === "") {
+      return;
+    }
+    this.db
+      .prepare(
+        `INSERT INTO document_submissions (scout_id, mail_id, completed_at) VALUES (?, ?, ?)
+         ON CONFLICT(scout_id) DO UPDATE SET mail_id = excluded.mail_id, completed_at = excluded.completed_at`,
+      )
+      .run(scoutId, mailId, at.toISOString());
+  }
+
+  submissionOf(scoutId: string): DocumentSubmission | null {
+    if (scoutId === "") {
+      return null;
+    }
+    const row = this.db
+      .prepare("SELECT mail_id, completed_at FROM document_submissions WHERE scout_id = ?")
+      .get(scoutId) as { mail_id: string; completed_at: string } | undefined;
+    if (!row) {
+      return null;
+    }
+    return { mailId: row.mail_id, completedAt: row.completed_at };
+  }
+
+  rejectionMailId(scoutId: string): string | null {
+    if (scoutId === "") {
+      return null;
+    }
+    const row = this.db
+      .prepare(
+        `SELECT i.mail_id AS mail_id
+         FROM mail_extracted_intents i
+         JOIN mail m ON m.gmail_id = i.mail_id
+         WHERE m.scout_id = ? AND i.intent_code = 'REJECTION'
+         ORDER BY m.sent_at DESC
+         LIMIT 1`,
+      )
+      .get(scoutId) as { mail_id: string } | undefined;
+    return row?.mail_id ?? null;
+  }
+
+  hasErasure(scoutId: string): boolean {
+    if (scoutId === "") {
+      return false;
+    }
+    const row = this.db
+      .prepare("SELECT id FROM user_mail_actions WHERE scout_id = ? AND action_code = 'REQUEST_ERASURE' LIMIT 1")
+      .get(scoutId);
+    return row !== undefined;
+  }
+
+  listingAddress(scoutId: string): string {
+    if (scoutId === "") {
+      return "";
+    }
+    const row = this.db.prepare("SELECT address FROM listings WHERE scout_id = ?").get(scoutId) as
+      | { address: string | null }
+      | undefined;
+    return row?.address?.trim() ?? "";
+  }
+
+  apartmentText(scoutId: string, exceptMailId: string): string {
+    if (scoutId === "") {
+      return "";
+    }
+    const rows = this.db
+      .prepare("SELECT body_text FROM mail WHERE scout_id = ? AND gmail_id != ? ORDER BY sent_at")
+      .all(scoutId, exceptMailId) as unknown as Array<{ body_text: string }>;
+    return rows.map((row) => row.body_text).join("\n");
+  }
+
+  saveScorecard(mailId: string, text: string, at: Date): void {
+    this.db
+      .prepare(
+        `INSERT INTO lease_audits (mail_id, scorecard_text, created_at) VALUES (?, ?, ?)
+         ON CONFLICT(mail_id) DO UPDATE SET scorecard_text = excluded.scorecard_text, created_at = excluded.created_at`,
+      )
+      .run(mailId, text, at.toISOString());
+  }
+
+  loadScorecard(mailId: string): string | null {
+    const row = this.db.prepare("SELECT scorecard_text FROM lease_audits WHERE mail_id = ?").get(mailId) as
+      | { scorecard_text: string }
+      | undefined;
+    return row?.scorecard_text ?? null;
+  }
+
+  promoteDueErasure(now: Date): void {
+    this.db
+      .prepare(
+        `UPDATE user_mail_actions SET status = 'PENDING'
+         WHERE action_code = 'REQUEST_ERASURE' AND status = 'SCHEDULED' AND deadline_at <= ?`,
+      )
+      .run(now.toISOString());
+  }
 }
 
 interface ActionRow {
@@ -634,6 +872,41 @@ interface OpenActionRow extends ActionRow {
   clean_delta_text: string;
   address: string;
   metadata_json: string;
+  dsk_violation: number;
+  other_body: string;
+  decline_body: string;
+  judgment_branch: string;
+  judgment_decision: string;
+}
+
+interface JudgmentRow {
+  id: number | bigint;
+  created_at: string;
+  scout_id: string;
+  mail_id: string;
+  source: string;
+  branch: string;
+  model: string;
+  stage: string;
+  proposal_json: string;
+  decision_json: string;
+  error: string;
+}
+
+function toJudgment(row: JudgmentRow): StoredJudgment {
+  return {
+    id: Number(row.id),
+    createdAt: row.created_at,
+    scoutId: row.scout_id,
+    mailId: row.mail_id,
+    source: row.source,
+    branch: row.branch,
+    model: row.model,
+    stage: row.stage,
+    proposalJson: row.proposal_json,
+    decisionJson: row.decision_json,
+    error: row.error,
+  };
 }
 
 function toAction(row: ActionRow): StoredAction {
@@ -661,6 +934,18 @@ function firstSlot(metadata: string): string {
   }
 }
 
+function requestedDocuments(metadata: string): string[] {
+  try {
+    const parsed = JSON.parse(metadata) as { requestedDocuments?: unknown };
+    if (!Array.isArray(parsed.requestedDocuments)) {
+      return [];
+    }
+    return parsed.requestedDocuments.filter((item): item is string => typeof item === "string");
+  } catch {
+    return [];
+  }
+}
+
 function parseFlags(payload: string): string[] {
   try {
     const parsed = JSON.parse(payload) as unknown;
@@ -671,6 +956,39 @@ function parseFlags(payload: string): string[] {
   } catch {
     return [];
   }
+}
+
+function concealed(operatorList: string, relevance: string): boolean {
+  if (operatorList === "hidden") {
+    return true;
+  }
+  return operatorList !== "shown" && relevance === "unrelated";
+}
+
+function judgmentsFor(db: DatabaseSync, mailIds: readonly string[]): Map<string, UnlinkedJudgment[]> {
+  const grouped = new Map<string, UnlinkedJudgment[]>();
+  if (mailIds.length === 0) {
+    return grouped;
+  }
+  const placeholders = mailIds.map(() => "?").join(", ");
+  const rows = db
+    .prepare(
+      `SELECT mail_id, intent_code, confidence, summary
+       FROM mail_extracted_intents WHERE mail_id IN (${placeholders})
+       ORDER BY intent_code`,
+    )
+    .all(...mailIds) as unknown as Array<{
+    mail_id: string;
+    intent_code: string;
+    confidence: number;
+    summary: string;
+  }>;
+  for (const row of rows) {
+    const list = grouped.get(row.mail_id) ?? [];
+    list.push({ code: row.intent_code, confidence: row.confidence, summary: row.summary });
+    grouped.set(row.mail_id, list);
+  }
+  return grouped;
 }
 
 function accountEmail(db: DatabaseSync): string | null {

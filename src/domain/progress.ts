@@ -1,5 +1,6 @@
 import { DomainError } from "./domain-error.js";
 import type { ListingStatus } from "./listing-status.js";
+import type { MailIntent } from "./mail-reply.js";
 
 export const FUNNEL_STAGES = [
   "discovered",
@@ -28,6 +29,45 @@ const RANK: Record<FunnelStage, number> = {
   viewing_offered: 50,
   scheduled: 60,
 };
+
+const PARENT: Partial<Record<FunnelStage, FunnelStage>> = {
+  filtered_out: "discovered",
+  manual: "discovered",
+  failed: "discovered",
+  applied: "discovered",
+  in_conversation: "applied",
+  viewing_offered: "in_conversation",
+  scheduled: "viewing_offered",
+};
+
+export function parentStage(stage: FunnelStage): FunnelStage | null {
+  return PARENT[stage] ?? null;
+}
+
+export function stageBranch(stage: FunnelStage): FunnelStage[] {
+  const children = new Map<FunnelStage, FunnelStage[]>();
+  for (const item of FUNNEL_STAGES) {
+    const parent = PARENT[item];
+    if (!parent) {
+      continue;
+    }
+    const list = children.get(parent);
+    if (list) {
+      list.push(item);
+    } else {
+      children.set(parent, [item]);
+    }
+  }
+  const branch: FunnelStage[] = [];
+  const walk = (current: FunnelStage) => {
+    branch.push(current);
+    for (const child of children.get(current) ?? []) {
+      walk(child);
+    }
+  };
+  walk(stage);
+  return branch;
+}
 
 export interface AdvanceResult {
   stage: FunnelStage;
@@ -83,6 +123,79 @@ export function backfillEntry(status: ListingStatus): BackfillEntry {
     return { stage, hop: null };
   }
   return { stage, hop: { from: "discovered", to: stage } };
+}
+
+export const APPLICATION_OUTCOMES = [
+  "open",
+  "cancelled_by_us",
+  "rejected",
+  "offer_declined",
+  "withdrawn",
+] as const;
+
+export type ApplicationOutcome = (typeof APPLICATION_OUTCOMES)[number];
+
+export const OUTCOME_LABELS: Record<ApplicationOutcome, string> = {
+  open: "Open",
+  cancelled_by_us: "Cancelled by us",
+  rejected: "Rejected",
+  offer_declined: "Offer declined",
+  withdrawn: "Withdrawn",
+};
+
+const REOPEN_INTENTS = new Set<MailIntent>([
+  "viewing_schedule",
+  "viewing_confirm",
+  "viewing_followup",
+  "slot_cancelled",
+  "contract_schedule",
+  "contract_confirm",
+  "contract_outcome",
+]);
+
+export function isApplicationOutcome(value: string): value is ApplicationOutcome {
+  return (APPLICATION_OUTCOMES as readonly string[]).includes(value);
+}
+
+export function assertApplicationOutcome(value: string): ApplicationOutcome {
+  if (!isApplicationOutcome(value)) {
+    throw new DomainError(`Unknown application outcome ${value}`);
+  }
+  return value;
+}
+
+export function mailOutcome(input: {
+  intent: MailIntent;
+  codes: readonly string[];
+}): ApplicationOutcome | "reopen" | null {
+  if (input.codes.includes("REJECTION")) {
+    return "rejected";
+  }
+  if (input.intent === "cancelled_by_us" || input.codes.includes("APPT_CANCELLED_BY_US")) {
+    return "cancelled_by_us";
+  }
+  if (REOPEN_INTENTS.has(input.intent)) {
+    return "reopen";
+  }
+  return null;
+}
+
+export function declineOutcome(intentCode: string): ApplicationOutcome | null {
+  if (intentCode === "POST_VIEWING_INTEREST") {
+    return "withdrawn";
+  }
+  if (intentCode === "CONTRACT_DRAFT_REVIEW") {
+    return "offer_declined";
+  }
+  if (
+    intentCode === "APPT_PROPOSAL" ||
+    intentCode === "APPT_CONFIRMATION" ||
+    intentCode === "CONTRACT_SIGNING_ARR" ||
+    intentCode === "APPT_SLOT_CANCELLED"
+  ) {
+    return "cancelled_by_us";
+  }
+  return null;
 }
 
 export const STAGE_LABELS: Record<FunnelStage, string> = {

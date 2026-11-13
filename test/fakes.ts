@@ -20,7 +20,7 @@ import type { ExposeRefreshQueue } from "../src/application/ports/expose-refresh
 import type { ProgressLog, ProgressNote, ProgressTransitionRow, StageRow, ApartmentCard } from "../src/application/ports/progress-log.js";
 import type { SelectorCache } from "../src/application/ports/selector-cache.js";
 import { exposeUrl } from "../src/domain/expose-url.js";
-import { advance, type FunnelStage } from "../src/domain/progress.js";
+import { advance, stageBranch, type ApplicationOutcome, type FunnelStage } from "../src/domain/progress.js";
 import type { LoopDependencies } from "../src/application/run-agent-loop.js";
 import type { ApplicantProfile, ProfileField } from "../src/domain/applicant-profile.js";
 import { CaptchaEncountered, type CaptchaSignal } from "../src/domain/captcha-signal.js";
@@ -193,10 +193,31 @@ export class InMemoryListings implements ListingRepository {
 
 export class InMemoryProgress implements ProgressLog {
   readonly stages = new Map<string, FunnelStage>();
+  readonly outcomes = new Map<string, ApplicationOutcome>();
   readonly transitions: ProgressTransitionRow[] = [];
 
   stageOf(scoutId: string): FunnelStage | null {
     return this.stages.get(scoutId) ?? null;
+  }
+
+  outcomeOf(scoutId: string): ApplicationOutcome | null {
+    if (!this.stages.has(scoutId)) {
+      return null;
+    }
+    return this.outcomes.get(scoutId) ?? "open";
+  }
+
+  setOutcome(scoutId: string, outcome: ApplicationOutcome, _at: Date): void {
+    if (!this.stages.has(scoutId)) {
+      return;
+    }
+    this.outcomes.set(scoutId, outcome);
+  }
+
+  reopenCancellation(scoutId: string, _at: Date): void {
+    if (this.outcomes.get(scoutId) === "cancelled_by_us") {
+      this.outcomes.set(scoutId, "open");
+    }
   }
 
   note(input: ProgressNote): boolean {
@@ -223,7 +244,9 @@ export class InMemoryProgress implements ProgressLog {
   }
 
   listStages(): StageRow[] {
-    return [...this.stages.entries()].map(([scoutId, stage]) => ({ scoutId, stage }));
+    return [...this.stages.entries()]
+      .filter(([scoutId]) => (this.outcomes.get(scoutId) ?? "open") === "open")
+      .map(([scoutId, stage]) => ({ scoutId, stage }));
   }
 
   listTransitions(): ProgressTransitionRow[] {
@@ -235,13 +258,29 @@ export class InMemoryProgress implements ProgressLog {
   }
 
   listApartments(stage: FunnelStage): ApartmentCard[] {
-    return this.listStages()
-      .filter((row) => row.stage === stage)
-      .map((row) => ({
-        scoutId: row.scoutId,
-        stage: row.stage,
+    const branch = new Set(stageBranch(stage));
+    return this.cards().filter((row) => branch.has(row.stage) && row.outcome === "open");
+  }
+
+  listAllApartments(): ApartmentCard[] {
+    return this.cards();
+  }
+
+  listClosed(): ApartmentCard[] {
+    return this.cards().filter((row) => row.outcome !== "open");
+  }
+
+  closedCount(): number {
+    return this.listClosed().length;
+  }
+
+  private cards(): ApartmentCard[] {
+    return [...this.stages.entries()].map(([scoutId, stage]) => ({
+        scoutId,
+        stage,
+        outcome: this.outcomes.get(scoutId) ?? "open",
         title: null,
-        url: exposeUrl(row.scoutId),
+        url: exposeUrl(scoutId),
         opened: false,
         address: null,
         priceCold: null,
@@ -261,7 +300,7 @@ export class InMemoryProgress implements ProgressLog {
         topic: null,
         mails: [],
         viewings: [],
-      }));
+    }));
   }
 }
 

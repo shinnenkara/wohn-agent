@@ -70,6 +70,7 @@ const MAIL_COLUMNS: ReadonlyArray<readonly [string, string]> = [
   ["in_reply_to", "TEXT NOT NULL DEFAULT ''"],
   ["references_header", "TEXT NOT NULL DEFAULT ''"],
   ["link_method", "TEXT NOT NULL DEFAULT ''"],
+  ["operator_list", "TEXT NOT NULL DEFAULT ''"],
 ];
 
 function ensureMailColumns(db: DatabaseSync): void {

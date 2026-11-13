@@ -11,12 +11,16 @@ import type {
 import { exposeUrl } from "../../domain/expose-url.js";
 import { gmailUrl } from "../../domain/gmail-url.js";
 import { gmailComposeUrl, mailboxAddress } from "../../domain/mail-reply.js";
+import { judgmentCitation } from "../../domain/triage.js";
 import { isListingStatus } from "../../domain/listing-status.js";
 import type { MailCandidate } from "../../domain/mail-link.js";
 import {
   advance,
+  assertApplicationOutcome,
   assertFunnelStage,
   backfillEntry,
+  stageBranch,
+  type ApplicationOutcome,
   type FunnelStage,
   type ProgressSource,
 } from "../../domain/progress.js";
@@ -44,6 +48,7 @@ interface ListingBackfillRow {
 interface ApartmentSql {
   scout_id: string;
   stage: string;
+  outcome: string;
   title: string | null;
   url: string | null;
   address: string | null;
@@ -76,6 +81,7 @@ interface MailSql {
   relation: string;
   body: string;
   alt_body: string;
+  other_body: string;
   clean_text: string;
 }
 
@@ -95,6 +101,27 @@ export class SqliteProgressLog implements ProgressLog {
       | { stage: string }
       | undefined;
     return row ? assertFunnelStage(row.stage) : null;
+  }
+
+  outcomeOf(scoutId: string): ApplicationOutcome | null {
+    const row = this.db.prepare("SELECT outcome FROM progress WHERE scout_id = ?").get(scoutId) as
+      | { outcome: string }
+      | undefined;
+    return row ? assertApplicationOutcome(row.outcome) : null;
+  }
+
+  setOutcome(scoutId: string, outcome: ApplicationOutcome, at: Date): void {
+    this.db
+      .prepare("UPDATE progress SET outcome = ?, updated_at = ? WHERE scout_id = ?")
+      .run(outcome, at.toISOString(), scoutId);
+  }
+
+  reopenCancellation(scoutId: string, at: Date): void {
+    this.db
+      .prepare(
+        "UPDATE progress SET outcome = 'open', updated_at = ? WHERE scout_id = ? AND outcome = 'cancelled_by_us'",
+      )
+      .run(at.toISOString(), scoutId);
   }
 
   note(input: ProgressNote): boolean {
@@ -153,7 +180,9 @@ export class SqliteProgressLog implements ProgressLog {
   }
 
   listStages(): StageRow[] {
-    const rows = this.db.prepare("SELECT scout_id, stage FROM progress").all() as unknown as StageSql[];
+    const rows = this.db
+      .prepare("SELECT scout_id, stage FROM progress WHERE outcome = 'open'")
+      .all() as unknown as StageSql[];
     return rows.map((row) => ({ scoutId: row.scout_id, stage: assertFunnelStage(row.stage) }));
   }
 
@@ -181,7 +210,8 @@ export class SqliteProgressLog implements ProgressLog {
         `SELECT l.scout_id, l.title, l.address, l.price_cold
          FROM progress p
          JOIN listings l ON l.scout_id = p.scout_id
-         WHERE p.stage IN ('applied', 'in_conversation', 'viewing_offered', 'scheduled')
+         WHERE p.outcome = 'open'
+           AND p.stage IN ('applied', 'in_conversation', 'viewing_offered', 'scheduled')
            AND (
              (l.applied_at IS NOT NULL AND l.applied_at >= ?)
              OR p.updated_at >= ?
@@ -202,13 +232,34 @@ export class SqliteProgressLog implements ProgressLog {
   }
 
   listApartments(stage: FunnelStage): ApartmentCard[] {
+    const branch = stageBranch(stage);
+    const marks = branch.map(() => "?").join(", ");
+    return this.loadApartments(`p.stage IN (${marks}) AND p.outcome = 'open'`, branch);
+  }
+
+  listAllApartments(): ApartmentCard[] {
+    return this.loadApartments("1 = 1", []);
+  }
+
+  listClosed(): ApartmentCard[] {
+    return this.loadApartments("p.outcome != 'open'", []);
+  }
+
+  closedCount(): number {
+    const row = this.db.prepare("SELECT COUNT(*) AS count FROM progress WHERE outcome != 'open'").get() as {
+      count: number;
+    };
+    return Number(row.count);
+  }
+
+  private loadApartments(where: string, params: readonly string[]): ApartmentCard[] {
     const energy = this.columnExists("listings", "energy_class");
     const image = this.columnExists("listings", "preview_image");
     const snapshot = this.columnExists("listings", "snapshot");
     const refresh = this.tableExists("expose_refresh");
     const rows = this.db
       .prepare(
-        `SELECT p.scout_id, p.stage, l.title, l.url, l.address,
+        `SELECT p.scout_id, p.stage, p.outcome, l.title, l.url, l.address,
                 l.price_cold, l.price_warm, l.extra_costs, l.deposit, l.rooms, l.area_sqm,
                 l.floor, l.move_in, l.description, l.status AS listing_status,
                 ${energy ? "l.energy_class" : "NULL"} AS energy_class,
@@ -220,10 +271,10 @@ export class SqliteProgressLog implements ProgressLog {
          FROM progress p
          LEFT JOIN listings l ON l.scout_id = p.scout_id
          ${refresh ? "LEFT JOIN expose_refresh r ON r.scout_id = p.scout_id" : ""}
-         WHERE p.stage = ?
+         WHERE ${where}
          ORDER BY l.discovered_at IS NULL, l.discovered_at DESC, p.scout_id DESC`,
       )
-      .all(stage) as unknown as ApartmentSql[];
+      .all(...params) as unknown as ApartmentSql[];
     const ids = rows.map((row) => row.scout_id);
     const email = this.accountEmail();
     const mails = this.mailsFor(ids, email);
@@ -232,6 +283,7 @@ export class SqliteProgressLog implements ProgressLog {
     return rows.map((row) => ({
       scoutId: row.scout_id,
       stage: assertFunnelStage(row.stage),
+      outcome: assertApplicationOutcome(row.outcome),
       title: row.title,
       url: row.url ?? exposeUrl(row.scout_id),
       opened:
@@ -326,17 +378,19 @@ export class SqliteProgressLog implements ProgressLog {
       .prepare(
         `SELECT m.scout_id, m.gmail_id, m.from_addr, ${replyTo ? "m.reply_to" : "'' AS reply_to"}, m.subject, m.sent_at,
                 ${clean ? "m.clean_delta_text" : "''"} AS clean_text,
-                ${drafts ? "COALESCE(d.intent, '') AS intent, COALESCE(d.relation, '') AS relation, COALESCE(d.body, '') AS body, COALESCE(d.alt_body, '') AS alt_body" : "'' AS intent, '' AS relation, '' AS body, '' AS alt_body"}
+                ${drafts ? "COALESCE(d.intent, '') AS intent, COALESCE(d.relation, '') AS relation, COALESCE(d.body, '') AS body, COALESCE(d.alt_body, '') AS alt_body, COALESCE(d.other_body, '') AS other_body" : "'' AS intent, '' AS relation, '' AS body, '' AS alt_body, '' AS other_body"}
          FROM mail m
          ${drafts ? "LEFT JOIN reply_draft d ON d.mail_id = m.gmail_id" : ""}
          WHERE m.scout_id IN (${placeholders})
          ORDER BY m.sent_at DESC`,
       )
       .all(...ids) as unknown as MailSql[];
-    const triage = this.triageFor(rows.map((row) => row.gmail_id));
+    const mailIds = rows.map((row) => row.gmail_id);
+    const triage = this.triageFor(mailIds);
+    const judgments = this.judgmentsFor(mailIds);
     for (const row of rows) {
       const list = grouped.get(row.scout_id) ?? [];
-      list.push(toApartmentMail(row, email, triage.get(row.gmail_id)));
+      list.push(toApartmentMail(row, email, triage.get(row.gmail_id), judgments.get(row.gmail_id)));
       grouped.set(row.scout_id, list);
     }
     return grouped;
@@ -385,6 +439,26 @@ export class SqliteProgressLog implements ProgressLog {
       view.riskLevel = row.risk_level;
       view.redFlags = parseStringList(row.red_flags_json);
       grouped.set(row.mail_id, view);
+    }
+    return grouped;
+  }
+
+  private judgmentsFor(mailIds: readonly string[]): Map<string, { branch: string; citation: string }> {
+    const grouped = new Map<string, { branch: string; citation: string }>();
+    if (mailIds.length === 0 || !this.tableExists("model_judgment")) {
+      return grouped;
+    }
+    const placeholders = mailIds.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(
+        `SELECT mail_id, branch, decision_json FROM model_judgment
+         WHERE id IN (
+           SELECT MAX(id) FROM model_judgment WHERE mail_id IN (${placeholders}) GROUP BY mail_id
+         )`,
+      )
+      .all(...mailIds) as unknown as Array<{ mail_id: string; branch: string; decision_json: string }>;
+    for (const row of rows) {
+      grouped.set(row.mail_id, { branch: row.branch, citation: judgmentCitation(row.decision_json) });
     }
     return grouped;
   }
@@ -511,6 +585,8 @@ interface MailTriageView {
   slots: string[];
   linkUrl: string;
   linkHost: string;
+  judgmentBranch: string;
+  judgmentCitation: string;
 }
 
 function emptyTriage(): MailTriageView {
@@ -522,10 +598,17 @@ function emptyTriage(): MailTriageView {
     slots: [],
     linkUrl: "",
     linkHost: "",
+    judgmentBranch: "",
+    judgmentCitation: "",
   };
 }
 
-function toApartmentMail(row: MailSql, email: string | null, triage: MailTriageView | undefined): ApartmentMail {
+function toApartmentMail(
+  row: MailSql,
+  email: string | null,
+  triage: MailTriageView | undefined,
+  judgment: { branch: string; citation: string } | undefined,
+): ApartmentMail {
   const to = mailboxAddress(row.reply_to, row.from_addr);
   const view = triage ?? emptyTriage();
   return {
@@ -540,6 +623,10 @@ function toApartmentMail(row: MailSql, email: string | null, triage: MailTriageV
     altDraft: row.alt_body,
     composeUrl: row.body ? gmailComposeUrl({ account: email, to, subject: row.subject, body: row.body }) : "",
     altComposeUrl: row.alt_body ? gmailComposeUrl({ account: email, to, subject: row.subject, body: row.alt_body }) : "",
+    otherDraft: row.other_body,
+    otherComposeUrl: row.other_body
+      ? gmailComposeUrl({ account: email, to, subject: row.subject, body: row.other_body })
+      : "",
     cleanText: row.clean_text,
     intents: view.intents,
     riskLevel: view.riskLevel,
@@ -549,6 +636,8 @@ function toApartmentMail(row: MailSql, email: string | null, triage: MailTriageV
     linkUrl: view.linkUrl,
     linkHost: view.linkHost,
     linksAreText: view.riskLevel === "CRITICAL_SCAM_BLOCK",
+    judgmentBranch: judgment?.branch ?? "",
+    judgmentCitation: judgment?.citation ?? "",
   };
 }
 

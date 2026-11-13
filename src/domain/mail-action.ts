@@ -9,15 +9,16 @@ export const ACTION_STATUSES = [
   "COMPLETED",
   "SUPERSEDED",
   "BLOCKED_SCAM",
+  "SCHEDULED",
 ] as const;
 
 export type ActionStatus = (typeof ACTION_STATUSES)[number];
 
-const SUPERSEDE_INTENTS = ["APPT_CONFIRMATION", "REJECTION"] as const;
+const SUPERSEDE_INTENTS = ["APPT_CONFIRMATION", "REJECTION", "APPT_CANCELLED_BY_US", "APPT_SLOT_CANCELLED"] as const;
 
 export interface ActionTemplate {
   code: string;
-  intentCode: IntentCode;
+  intentCode: string;
   titleTemplate: string;
   slaMinutes: number;
   consoleHotkey: "o" | "d" | "s";
@@ -27,12 +28,14 @@ export const ACTION_TEMPLATES: readonly ActionTemplate[] = [
   { code: "OPEN_PORTAL", intentCode: "PORTAL_INVITE_LINK", titleTemplate: "Open booking link", slaMinutes: 15, consoleHotkey: "o" },
   { code: "ANSWER_PROPOSAL", intentCode: "APPT_PROPOSAL", titleTemplate: "Answer viewing proposal", slaMinutes: 30, consoleHotkey: "d" },
   { code: "CONFIRM_APPT", intentCode: "APPT_CONFIRMATION", titleTemplate: "Confirm appointment", slaMinutes: 60, consoleHotkey: "d" },
+  { code: "RESCHEDULE_APPT", intentCode: "APPT_SLOT_CANCELLED", titleTemplate: "Answer cancelled viewing", slaMinutes: 30, consoleHotkey: "d" },
   { code: "SIGNING_SLOT", intentCode: "CONTRACT_SIGNING_ARR", titleTemplate: "Confirm signing time", slaMinutes: 120, consoleHotkey: "d" },
   { code: "REVIEW_CONTRACT", intentCode: "CONTRACT_DRAFT_REVIEW", titleTemplate: "Review contract", slaMinutes: 240, consoleHotkey: "d" },
   { code: "POST_VIEWING", intentCode: "POST_VIEWING_INTEREST", titleTemplate: "Reply after viewing", slaMinutes: 240, consoleHotkey: "d" },
   { code: "SEND_DISCLOSURE", intentCode: "SELF_DISCLOSURE_REQ", titleTemplate: "Send self-disclosure", slaMinutes: 1440, consoleHotkey: "d" },
   { code: "SEND_DOCUMENTS", intentCode: "DOC_PACKAGE_REQ", titleTemplate: "Send documents", slaMinutes: 1440, consoleHotkey: "d" },
   { code: "REVIEW_SCAM", intentCode: "SCAM_SUSPECTED", titleTemplate: "Review suspected scam", slaMinutes: 60, consoleHotkey: "s" },
+  { code: "REQUEST_ERASURE", intentCode: "REQUEST_ERASURE", titleTemplate: "Request data deletion", slaMinutes: 1440, consoleHotkey: "d" },
 ];
 
 export interface PlannedAction {
@@ -57,6 +60,10 @@ export interface QueueRow {
   badges: readonly string[];
   actionUrl: string;
   draftResponseText: string;
+  otherBody: string;
+  declineBody: string;
+  declineLabel: string;
+  reason: string;
 }
 
 const SLOT_MS = 60 * 60 * 1000;
@@ -168,6 +175,11 @@ export function toQueueRow(
     from: string;
     body: string;
     slotText: string;
+    intentCode?: string;
+    otherBody?: string;
+    declineBody?: string;
+    judgmentBranch?: string;
+    judgmentCitation?: string;
   },
   busy: readonly BusyInterval[],
   now: Date,
@@ -188,7 +200,15 @@ export function toQueueRow(
     ),
     actionUrl: input.actionUrl,
     draftResponseText: input.draftResponseText,
+    otherBody: input.otherBody ?? "",
+    declineBody: input.declineBody ?? "",
+    declineLabel: input.intentCode === "POST_VIEWING_INTEREST" ? "Withdraw" : "Decline",
+    reason: judgmentReason(input.judgmentBranch ?? "", input.judgmentCitation ?? ""),
   };
+}
+
+function judgmentReason(branch: string, citation: string): string {
+  return [branch.trim(), citation.trim()].filter(Boolean).join(" · ");
 }
 
 export function countdownLabel(deadlineAt: string, now: Date): string {
@@ -219,6 +239,9 @@ export function shortPriority(priority: string): string {
   }
   if (priority === "P2_WARNING") {
     return "P2";
+  }
+  if (priority === "P3_SILENT") {
+    return "P3";
   }
   return priority;
 }

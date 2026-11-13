@@ -11,6 +11,7 @@ import {
   settleReply,
   type OpenTopic,
 } from "../../src/domain/mail-reply.js";
+import { declineOutcome, mailOutcome } from "../../src/domain/progress.js";
 import { berlinInstant } from "../../src/domain/timing.js";
 
 const documents: OpenTopic = { topic: "documents", relation: "start" };
@@ -196,6 +197,68 @@ describe("mail reply classification", () => {
     const settled = settleReply(open, "documents", "nicht im text", "Betreff", "Hallo zusammen");
     assert.equal(settled.intent, "unknown");
     assert.equal(nextTopic(open, settled), open);
+  });
+
+  it("treats an ImmoScout Absage receipt as our cancellation and writes no reply", () => {
+    const body = "Guten Tag, hiermit bestätigen wir Ihre Absage für die untenstehende Immobilie.";
+    const classification = classifyReply("Besichtigungstermin abgesagt", body, {
+      topic: "viewing",
+      relation: "close",
+    });
+    assert.equal(classification?.intent, "cancelled_by_us");
+    assert.equal(classifyReply("Absage", "Ich sage den Termin ab.", null)?.intent, "cancelled_by_us");
+    assert.equal(classification?.relation, "close");
+    assert.equal(classification?.topic, "viewing");
+    assert.equal(
+      renderDraft({
+        classification: classification!,
+        subject: "Besichtigungstermin abgesagt",
+        body,
+        contactName: null,
+        slots: [],
+        visit: null,
+      }),
+      null,
+    );
+    assert.equal(mailOutcome({ intent: "cancelled_by_us", codes: ["APPT_CANCELLED_BY_US"] }), "cancelled_by_us");
+  });
+
+  it("asks for a new time when the landlord cancels only the slot", () => {
+    const classification = classifyReply("Termin", "Der Termin entfällt. Bitte nennen Sie neue Zeiten.", {
+      topic: "viewing",
+      relation: "close",
+    });
+    assert.equal(classification?.intent, "slot_cancelled");
+    assert.equal(classification?.relation, "start");
+    const draft = renderDraft({
+      classification: classification!,
+      subject: "Termin",
+      body: "Der Termin entfällt. Bitte nennen Sie neue Zeiten.",
+      contactName: null,
+      slots: [],
+      visit: null,
+    });
+    assert.equal(draft?.body.includes("Bitte nennen Sie mir ein paar mögliche Zeiten."), true);
+    assert.equal(draft?.altBody.includes("Bitte sagen Sie den Termin ab."), true);
+    assert.equal(mailOutcome({ intent: "slot_cancelled", codes: ["APPT_SLOT_CANCELLED"] }), "reopen");
+  });
+
+  it("offers another time and a decline on a proposed viewing", () => {
+    const classification = classifyReply("Termine", "Wann können Sie zur Besichtigung kommen?", null);
+    const draft = renderDraft({
+      classification: classification!,
+      subject: "Termine",
+      body: "Wann können Sie zur Besichtigung kommen?",
+      contactName: null,
+      slots: [],
+      visit: null,
+    });
+    assert.equal(draft?.otherBody.includes("passt mir leider nicht"), true);
+    assert.equal(draft?.altBody.includes("Bitte sagen Sie den Termin ab."), true);
+    assert.equal(declineOutcome("APPT_PROPOSAL"), "cancelled_by_us");
+    assert.equal(declineOutcome("CONTRACT_DRAFT_REVIEW"), "offer_declined");
+    assert.equal(declineOutcome("POST_VIEWING_INTEREST"), "withdrawn");
+    assert.equal(declineOutcome("CONTRACT_SIGNING_ARR"), "cancelled_by_us");
   });
 
   it("opens Gmail with the draft filled in", () => {

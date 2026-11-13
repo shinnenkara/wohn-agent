@@ -40,6 +40,19 @@ describe("scout mail", () => {
     assert.equal(parsed.title, "1-Zimmer-Apartment in Berlin Wedding - U-Bahn Pankstr.");
   });
 
+  it("reads a Düsseldorf send confirmation as a notice with the street", () => {
+    const parsed = parseScoutMail(
+      "ImmoScout24 <noreply@immobilienscout24.de>",
+      "Ihre persönliche Vorstellung beim Anbieter",
+      "Heesenstr. XX,\n40549 Düsseldorf\nhttps://www.immobilienscout24.de/expose/65352507",
+      "",
+    );
+    assert.equal(parsed.kind, "notice");
+    assert.equal(parsed.exposeId, "65352507");
+    assert.equal(parsed.postcode, "40549");
+    assert.equal(parsed.address, "Heesenstr. XX, 40549 Düsseldorf");
+  });
+
   it("does not treat a saved search as an application notice", () => {
     const parsed = parseScoutMail(
       "ImmoScout24 <myscout@immobilienscout24.de>",

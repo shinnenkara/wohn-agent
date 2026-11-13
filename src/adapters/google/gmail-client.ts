@@ -1,34 +1,45 @@
-import type { FetchedMail, Mailbox } from "../../application/ports/mailbox.js";
+import type { FetchedMail, Mailbox, MailListOptions } from "../../application/ports/mailbox.js";
 import { gmailSearchQuery } from "../../domain/google-window.js";
 import { readGmailMessage, type GmailMessageJson } from "./gmail-message.js";
-import { authedGet, type Authorizer } from "./authed-get.js";
+import { authedGet, GoogleQuotaError, type Authorizer } from "./authed-get.js";
 
 const GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me";
+const FETCH_BATCH = 10;
 
 export class GmailMailbox implements Mailbox {
   constructor(
     private readonly authorizer: Authorizer,
     private readonly fetchImpl: typeof fetch,
+    private readonly sleep: (ms: number) => Promise<void> = delay,
   ) {}
 
   async historyId(): Promise<string> {
-    const profile = await authedGet<{ historyId?: string }>(this.authorizer, this.fetchImpl, `${GMAIL}/profile`);
+    const profile = await this.get<{ historyId?: string }>(`${GMAIL}/profile`);
     if (!profile.body?.historyId) {
       throw new Error("gmail did not return a history id");
     }
     return profile.body.historyId;
   }
 
-  async listSince(since: Date, till: Date | null): Promise<FetchedMail[]> {
+  async listSince(since: Date, till: Date | null, options?: MailListOptions): Promise<FetchedMail[]> {
     const ids = await this.listIds(gmailSearchQuery(since, till));
-    const mails: FetchedMail[] = [];
-    for (const id of ids) {
-      const message = await this.getMessage(id);
-      if (message) {
-        mails.push(message);
+    const pending = ids.filter((id) => !options?.skip?.has(id));
+    const kept: FetchedMail[] = [];
+    for (let index = 0; index < pending.length; index += FETCH_BATCH) {
+      const batch: FetchedMail[] = [];
+      for (const id of pending.slice(index, index + FETCH_BATCH)) {
+        const message = await this.getMessage(id);
+        if (message) {
+          batch.push(message);
+        }
+      }
+      if (options?.onBatch) {
+        await options.onBatch(batch);
+      } else {
+        kept.push(...batch);
       }
     }
-    return mails;
+    return options?.onBatch ? [] : kept;
   }
 
   async addedSince(startId: string): Promise<{ mails: FetchedMail[]; latestId: string; expired: boolean }> {
@@ -43,11 +54,9 @@ export class GmailMailbox implements Mailbox {
       if (pageToken) {
         params.set("pageToken", pageToken);
       }
-      const response = await authedGet<HistoryResponse>(
-        this.authorizer,
-        this.fetchImpl,
+      const response = await this.get<HistoryResponse>(
         `${GMAIL}/history?${params.toString()}`,
-        { allowStatus: [404] },
+        [404],
       );
       if (response.status === 404) {
         return { mails: [], latestId: startId, expired: true };
@@ -83,9 +92,7 @@ export class GmailMailbox implements Mailbox {
       if (pageToken) {
         params.set("pageToken", pageToken);
       }
-      const page = await authedGet<{ messages?: Array<{ id?: string }>; nextPageToken?: string }>(
-        this.authorizer,
-        this.fetchImpl,
+      const page = await this.get<{ messages?: Array<{ id?: string }>; nextPageToken?: string }>(
         `${GMAIL}/messages?${params.toString()}`,
       );
       for (const message of page.body?.messages ?? []) {
@@ -99,16 +106,27 @@ export class GmailMailbox implements Mailbox {
   }
 
   private async getMessage(id: string): Promise<FetchedMail | null> {
-    const response = await authedGet<GmailMessageJson>(
-      this.authorizer,
-      this.fetchImpl,
+    const response = await this.get<GmailMessageJson>(
       `${GMAIL}/messages/${encodeURIComponent(id)}?format=full`,
-      { allowStatus: [404] },
+      [404],
     );
     if (response.status === 404 || !response.body) {
       return null;
     }
     return readGmailMessage(response.body);
+  }
+
+  private async get<T>(url: string, allowStatus: number[] = []): Promise<{ status: number; body: T | null }> {
+    for (;;) {
+      try {
+        return await authedGet<T>(this.authorizer, this.fetchImpl, url, { allowStatus });
+      } catch (error) {
+        if (!(error instanceof GoogleQuotaError)) {
+          throw error;
+        }
+        await this.sleep(error.retryAfterMs);
+      }
+    }
   }
 }
 
@@ -116,4 +134,8 @@ interface HistoryResponse {
   historyId?: string;
   nextPageToken?: string;
   history?: Array<{ messagesAdded?: Array<{ message?: { id?: string } }> }>;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

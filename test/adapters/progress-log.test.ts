@@ -100,6 +100,7 @@ describe("sqlite progress", () => {
         topic: "documents",
         body: "Gerne sende ich Ihnen die Unterlagen.",
         altBody: "",
+        otherBody: "",
         createdAt: at,
       });
       mail.saveOpenTopic(applied.scoutId, { topic: "documents", relation: "start" }, at);
@@ -193,6 +194,9 @@ describe("sqlite progress", () => {
       assert.match(page, /Show message/);
       assert.match(page, /mail-body/);
       assert.match(page, /mail\.intents/);
+      assert.match(page, /Not read yet/);
+      assert.match(page, /show-hidden/);
+      assert.match(page, /hide-mail/);
       assert.match(page, /linksAreText/);
       assert.match(page, /Europe\/Berlin/);
       assert.match(page, /!row\.title && !row\.address && !row\.priceCold && !row\.priceWarm && !row\.rooms && !row\.areaSqm/);
@@ -271,6 +275,86 @@ describe("sqlite progress", () => {
       assert.equal(cards[0]?.discoveredAt, "2026-11-06T15:30:00.000Z");
       assert.equal(cards[1]?.discoveredAt, "2026-11-04T10:00:00.000Z");
       assert.equal(cards[2]?.discoveredAt, null);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("lists every apartment when no stage is selected", () => {
+    const db = openDatabase(":memory:");
+    try {
+      const listings = new SqliteListingRepository(db);
+      const discovered = discoverListing("100000001", new Date("2026-11-04T10:00:00.000Z"));
+      const applied = discoverListing("100000002", new Date("2026-11-05T10:00:00.000Z"))
+        .startApplying()
+        .markApplied(new Date("2026-11-05T12:00:00.000Z"));
+      const filtered = discoverListing("100000003", new Date("2026-11-06T10:00:00.000Z"));
+      listings.insertAll([discovered, filtered]);
+      listings.save(applied);
+      const progress = new SqliteProgressLog(db);
+      const at = new Date("2026-11-06T16:00:00.000Z");
+      progress.backfillListings(at);
+      progress.note({
+        scoutId: filtered.scoutId,
+        next: "filtered_out",
+        source: "apply",
+        evidenceId: null,
+        at,
+      });
+      progress.setOutcome(applied.scoutId, "rejected", at);
+      const cards = progress.listAllApartments();
+      assert.deepEqual(
+        cards.map((card) => card.scoutId),
+        ["100000003", "100000002", "100000001"],
+      );
+      assert.equal(cards.find((card) => card.scoutId === applied.scoutId)?.outcome, "rejected");
+      assert.equal(cards.find((card) => card.scoutId === filtered.scoutId)?.stage, "filtered_out");
+      assert.equal(progress.listApartments("applied").length, 0);
+      assert.equal(progress.listClosed().length, 1);
+      assert.deepEqual(
+        progress.listApartments("discovered").map((card) => card.scoutId),
+        [filtered.scoutId, discovered.scoutId],
+      );
+      assert.deepEqual(
+        progress.listApartments("filtered_out").map((card) => card.scoutId),
+        [filtered.scoutId],
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  it("lists a stage together with the stages under it", () => {
+    const db = openDatabase(":memory:");
+    try {
+      const listings = new SqliteListingRepository(db);
+      const applied = discoverListing("100000001", new Date("2026-11-04T10:00:00.000Z"))
+        .startApplying()
+        .markApplied(new Date("2026-11-04T12:00:00.000Z"));
+      const talking = discoverListing("100000002", new Date("2026-11-05T10:00:00.000Z"))
+        .startApplying()
+        .markApplied(new Date("2026-11-05T12:00:00.000Z"));
+      const filtered = discoverListing("100000003", new Date("2026-11-06T10:00:00.000Z"));
+      listings.insertAll([filtered]);
+      listings.save(applied);
+      listings.save(talking);
+      const progress = new SqliteProgressLog(db);
+      const at = new Date("2026-11-06T16:00:00.000Z");
+      progress.backfillListings(at);
+      progress.note({ scoutId: talking.scoutId, next: "in_conversation", source: "mail", evidenceId: null, at });
+      progress.note({ scoutId: filtered.scoutId, next: "filtered_out", source: "apply", evidenceId: null, at });
+      assert.deepEqual(
+        progress.listApartments("applied").map((card) => card.scoutId),
+        [talking.scoutId, applied.scoutId],
+      );
+      assert.deepEqual(
+        progress.listApartments("in_conversation").map((card) => card.scoutId),
+        [talking.scoutId],
+      );
+      assert.deepEqual(
+        progress.listApartments("discovered").map((card) => card.scoutId),
+        [filtered.scoutId, talking.scoutId, applied.scoutId],
+      );
     } finally {
       db.close();
     }
@@ -481,6 +565,59 @@ describe("sqlite progress", () => {
       const card = progress.listApartments("in_conversation").find((item) => item.scoutId === applied.scoutId);
       assert.equal(card?.mails.length, 2);
       assert.match(card?.mails.map((item) => item.cleanText).join(" "), /Bitte bestätigen/);
+      mail.insertMail(
+        {
+          gmailId: "m-judge",
+          threadId: "t-judge",
+          from: "Oleksii <a@example.com>",
+          subject: "Absage",
+          sentAt: "2026-11-03T11:00:00.000Z",
+          text: "Absage des Termins.",
+          html: "",
+          cleanText: "Absage des Termins.",
+          inReplyTo: "",
+          references: "",
+          linkMethod: "",
+          kind: "landlord",
+          scoutId: "",
+          replyTo: "",
+          messageId: "",
+        },
+        at,
+      );
+      mail.saveTriage(
+        "m-judge",
+        [
+          {
+            code: "APPT_PROPOSAL",
+            confidence: 0.7,
+            summary: "slot",
+            metadataJson: JSON.stringify({
+              citation: "Absage",
+              actionDeepLink: null,
+              linkCitation: null,
+              requestedDocuments: [],
+              proposedSlots: [],
+            }),
+            dskViolation: false,
+          },
+        ],
+        { level: "SAFE", redFlagsJson: "[]", relevance: "possible" },
+      );
+      mail.insertAction({
+        scoutId: "",
+        mailId: "m-judge",
+        intentCode: "APPT_PROPOSAL",
+        actionCode: "ANSWER_PROPOSAL",
+        status: "PENDING",
+        priority: "P0_CRITICAL",
+        actionUrl: "",
+        draftResponseText: "",
+        deadlineAt: "2026-11-03T12:00:00.000Z",
+        createdAt: at,
+      });
+      assert.equal(linkUnlinkedMail(path, "m-judge", applied.scoutId, at).status, 200);
+      assert.equal(mail.listActions().find((action) => action.mailId === "m-judge")?.scoutId, applied.scoutId);
     } finally {
       db.close();
       rmSync(dir, { recursive: true, force: true });

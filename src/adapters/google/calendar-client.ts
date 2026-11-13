@@ -83,8 +83,11 @@ export class CalendarAgenda implements Agenda {
 }
 
 function toEvent(item: CalendarItem): AgendaEvent | null {
-  if (!item.id || item.status === "cancelled") {
+  if (!item.id) {
     return null;
+  }
+  if (item.status === "cancelled") {
+    return { id: item.id, title: "", description: "", start: "", end: "", place: "", cancelled: true };
   }
   const start = item.start?.dateTime ?? item.start?.date ?? "";
   const end = item.end?.dateTime ?? item.end?.date ?? "";

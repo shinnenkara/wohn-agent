@@ -7,6 +7,7 @@ export interface ParsedMail {
   kind: MailKind;
   title: string;
   postcode: string;
+  address: string;
   rooms: string;
   size: string;
   rent: string;
@@ -14,7 +15,7 @@ export interface ParsedMail {
 
 const objekt = /objekt\s+(\d{5,})/i;
 const expose = /\/expose\/(\d{5,})/;
-const berlin = /\b(\d{5})\s+Berlin\b/g;
+const place = /\b(\d{5})\s+[\p{L}.-]+/gu;
 const rooms = /(\d+)\s*(?:Zimmer|Zi\.)/;
 const sizeRe = /(\d+(?:[.,]\d+)?)\s*m²/;
 const rentRe = /(\d{1,3}(?:\.\d{3})*(?:,\d+)?|\d+(?:,\d+)?)\s*€/g;
@@ -26,13 +27,14 @@ export function parseScoutMail(from: string, subject: string, text: string, html
     body = `${body}\n${html.replace(tags, "\n")}`;
   }
   body = cutFooter(body);
-  berlin.lastIndex = 0;
+  place.lastIndex = 0;
   rentRe.lastIndex = 0;
   const parsed: ParsedMail = {
     exposeId: exposeId(subject, html, body),
     kind: kind(from, subject),
     title: "",
     postcode: "",
+    address: "",
     rooms: first(rooms, body),
     size: first(sizeRe, body),
     rent: nearestRent(body),
@@ -40,6 +42,7 @@ export function parseScoutMail(from: string, subject: string, text: string, html
   const card = postcodeAndTitle(body);
   parsed.postcode = card.postcode;
   parsed.title = card.title;
+  parsed.address = card.address;
   return parsed;
 }
 
@@ -104,7 +107,11 @@ function kind(from: string, subject: string): MailKind {
   if (line.includes("suchauftrag")) {
     return "unclassified";
   }
-  if (sender.includes("myscout@") || line.includes("anfrage versendet")) {
+  if (
+    sender.includes("myscout@") ||
+    line.includes("anfrage versendet") ||
+    line.includes("persönliche vorstellung beim anbieter")
+  ) {
     return "notice";
   }
   if (line.includes("neue nachricht") || sender.includes("@nachrichten.immobilienscout24.de")) {
@@ -128,8 +135,8 @@ function cutFooter(body: string): string {
   return body.slice(0, cut);
 }
 
-function postcodeAndTitle(body: string): { postcode: string; title: string } {
-  for (const match of body.matchAll(berlin)) {
+function postcodeAndTitle(body: string): { postcode: string; title: string; address: string } {
+  for (const match of body.matchAll(place)) {
     const start = match.index ?? 0;
     const windowStart = Math.max(0, start - 180);
     const window = body.slice(windowStart, start + match[0].length).toLowerCase();
@@ -137,9 +144,16 @@ function postcodeAndTitle(body: string): { postcode: string; title: string } {
       continue;
     }
     const code = match[1] ?? "";
-    return { postcode: code, title: lineBefore(body, start) };
+    const title = lineBefore(body, start);
+    const street = streetish(title) ? title.replace(/,\s*$/, "") : "";
+    const locality = match[0].replace(/\s+/g, " ").trim();
+    return { postcode: code, title, address: street ? `${street}, ${locality}` : locality };
   }
-  return { postcode: "", title: "" };
+  return { postcode: "", title: "", address: "" };
+}
+
+function streetish(line: string): boolean {
+  return /(?:str\.|straße|strasse|\bweg\b|\bplatz\b|\ballee\b|\bdamm\b|\bufer\b|\bring\b)/iu.test(line);
 }
 
 function lineBefore(body: string, index: number): string {

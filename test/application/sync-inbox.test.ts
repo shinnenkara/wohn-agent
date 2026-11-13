@@ -3,20 +3,23 @@ import { describe, it } from "node:test";
 import { SqliteAccountStore } from "../../src/adapters/sqlite/account-store.js";
 import { openDatabase } from "../../src/adapters/sqlite/database.js";
 import { SqliteListingRepository } from "../../src/adapters/sqlite/listing-repository.js";
+import { SqliteListingRepository } from "../../src/adapters/sqlite/listing-repository.js";
 import { SqliteMailStore } from "../../src/adapters/sqlite/mail-store.js";
 import { SqliteProgressLog } from "../../src/adapters/sqlite/progress-log.js";
-import { syncHasNews, syncInbox, type SyncDependencies, type SyncOptions } from "../../src/application/sync-inbox.js";
+import { syncHasNews, syncInbox, MAIL_READINGS_PER_RUN, type SyncDependencies, type SyncOptions } from "../../src/application/sync-inbox.js";
+import { toQueueRow } from "../../src/domain/mail-action.js";
 import { MailReaderRateLimit, type MailInterpretation, type MailReader } from "../../src/application/ports/mail-reader.js";
 import type { ProposedTriage } from "../../src/domain/triage.js";
 import type { Alert } from "../../src/application/ports/notifier.js";
 import type { Agenda, AgendaEvent, AgendaPage } from "../../src/application/ports/agenda.js";
-import type { FetchedMail, Mailbox } from "../../src/application/ports/mailbox.js";
+import type { FetchedMail, Mailbox, MailListOptions } from "../../src/application/ports/mailbox.js";
 import type { MailResolver } from "../../src/application/ports/mail-resolver.js";
 import { FakeClock, discoverListing } from "../fakes.js";
 
 class FakeMailbox implements Mailbox {
   history = "h-new";
   expired = false;
+  failList = false;
   listed: FetchedMail[] = [];
   added: FetchedMail[] = [];
   readonly lists: Array<{ since: string; till: string | null }> = [];
@@ -27,9 +30,20 @@ class FakeMailbox implements Mailbox {
     return this.history;
   }
 
-  async listSince(since: Date, till: Date | null): Promise<FetchedMail[]> {
+  readonly skips: Array<ReadonlySet<string> | undefined> = [];
+
+  async listSince(since: Date, till: Date | null, options?: MailListOptions): Promise<FetchedMail[]> {
     this.lists.push({ since: since.toISOString(), till: till ? till.toISOString() : null });
-    return this.listed;
+    this.skips.push(options?.skip);
+    if (this.failList) {
+      throw new Error("backfill stopped");
+    }
+    const mails = this.listed.filter((item) => !options?.skip?.has(item.id));
+    if (options?.onBatch) {
+      await options.onBatch(mails);
+      return [];
+    }
+    return mails;
   }
 
   async addedSince(): Promise<{ mails: FetchedMail[]; latestId: string; expired: boolean }> {
@@ -108,6 +122,7 @@ function setup(): {
     mailbox,
     agenda,
     mail: new SqliteMailStore(db),
+    listings: new SqliteListingRepository(db),
     progress: new SqliteProgressLog(db),
     reader: null,
     resolver: null,
@@ -934,6 +949,322 @@ describe("sync inbox", () => {
         ],
       );
       assert.equal(actions.some((action) => action.mailId === "reject"), false);
+    } finally {
+      close();
+    }
+  });
+
+  it("reads ImmoScout mail before older newsletters and stops before a sixth newsletter", async () => {
+    const { deps, mailbox, close } = setup();
+    const seen: string[] = [];
+    deps.reader = {
+      async propose() {
+        throw new Error("triage replaces the single intent reading");
+      },
+      async triage(input): Promise<ProposedTriage> {
+        seen.push(input.subject);
+        return { intents: [], redFlags: [], relevance: "unrelated" };
+      },
+    };
+    try {
+      const news = ["n1", "n2", "n3", "n4", "n5"].map((id, index) =>
+        mail({
+          id,
+          from: "Healthy Gamer <hello@healthygamer.gg>",
+          threadId: `t-${id}`,
+          subject: `Newsletter ${id}`,
+          sentAt: `2026-10-0${index + 1}T12:00:00.000Z`,
+          text: "Keep giving up on your goals?",
+        }),
+      );
+      mailbox.listed = [
+        ...news,
+        mail({
+          id: "bounce",
+          from: "noreply@immobilienscout24.de",
+          threadId: "t-bounce",
+          subject: "Ihre Nachricht konnte nicht zugestellt werden",
+          sentAt: "2026-10-12T16:18:54.000Z",
+          text: "Die Nachricht konnte nicht zugestellt werden.",
+        }),
+      ];
+      await syncInbox(deps, options({ updateCursors: false }));
+      assert.equal(seen[0], "Ihre Nachricht konnte nicht zugestellt werden");
+      assert.equal(seen.includes("Newsletter n5"), false);
+      assert.equal(seen.length, 5);
+      const hidden = deps.mail.listUnlinkedMail(20);
+      assert.equal(hidden.some((item) => item.id === "bounce"), false);
+      const shown = deps.mail.listUnlinkedMail(20, true);
+      assert.equal(shown.find((item) => item.id === "bounce")?.relevance, "unrelated");
+      assert.equal(shown.find((item) => item.id === "n5")?.read, false);
+    } finally {
+      close();
+    }
+  });
+
+  it("does not draft a reply to the connected account", async () => {
+    const { deps, mailbox, close } = setup();
+    let outbound = false;
+    deps.reader = {
+      async propose() {
+        throw new Error("triage replaces the single intent reading");
+      },
+      async triage(input): Promise<ProposedTriage> {
+        outbound = input.outbound;
+        return {
+          intents: [
+            {
+              code: "REJECTION",
+              confidence: 0.8,
+              summary: "cancellation",
+              citation: "Absage",
+              deepLink: "",
+              linkCitation: "",
+              requestedDocuments: [],
+              proposedSlots: [],
+            },
+          ],
+          redFlags: [],
+          relevance: "unrelated",
+        };
+      },
+    };
+    try {
+      mailbox.listed = [
+        mail({
+          id: "mine",
+          from: "Oleksii Kharchenko <a@example.com>",
+          threadId: "t-mine",
+          subject: "Absage des Besichtigungstermins",
+          text: "Ich sage den Termin ab.",
+        }),
+      ];
+      const result = await syncInbox(deps, options({ updateCursors: false }));
+      assert.equal(outbound, true);
+      assert.equal(result.drafts, 0);
+      assert.equal(deps.mail.listActions().length, 0);
+      const row = deps.mail.listUnlinkedMail(20).find((item) => item.id === "mine");
+      assert.equal(row?.relevance, "possible");
+      assert.equal(row?.judgments[0]?.code, "REJECTION");
+      assert.equal(row?.judgments[0]?.confidence, 0.8);
+    } finally {
+      close();
+    }
+  });
+
+  it("stores the raw triage and the confirmed decision on the listing", async () => {
+    const { deps, mailbox, db, close } = setup();
+    openApplied(db, deps, "171599833", "Badstraße 54, 13357 Berlin", 900);
+    deps.reader = {
+      async propose() {
+        throw new Error("triage replaces the single intent reading");
+      },
+      async triage(): Promise<ProposedTriage> {
+        return {
+          intents: [
+            {
+              code: "DOC_PACKAGE_REQ",
+              confidence: 1,
+              summary: "payslips",
+              citation: "Gehaltsnachweise",
+              deepLink: "",
+              linkCitation: "",
+              requestedDocuments: ["PAYSLIPS_3M"],
+              proposedSlots: [],
+            },
+          ],
+          redFlags: [],
+        };
+      },
+    };
+    try {
+      mailbox.listed = [
+        mail({
+          id: "bundle",
+          from: "Verwaltung <haus@example.com>",
+          subject: "Unterlagen",
+          text: "Objekt 171599833\nBitte senden Sie drei Gehaltsnachweise.",
+        }),
+      ];
+      await syncInbox(deps, options({ updateCursors: false }));
+      const stored = deps.mail.judgmentsForMail("bundle");
+      assert.equal(stored.length, 1);
+      const row = stored[0];
+      assert.equal(row?.scoutId, "171599833");
+      assert.equal(row?.source, "mail_triage");
+      assert.equal(row?.branch, "model");
+      assert.equal(row?.model, "gemini-3.5-flash-lite");
+      assert.equal(row?.stage, "in_conversation");
+      assert.equal(row?.error, "");
+      const proposal = JSON.parse(row?.proposalJson ?? "") as { intents: Array<{ code: string }> };
+      assert.equal(proposal.intents[0]?.code, "DOC_PACKAGE_REQ");
+      const decision = JSON.parse(row?.decisionJson ?? "") as {
+        riskLevel: string;
+        intents: Array<{ code: string; citation: string; requestedDocuments: string[] }>;
+      };
+      assert.equal(decision.riskLevel, "SAFE");
+      assert.equal(decision.intents[0]?.code, "DOC_PACKAGE_REQ");
+      assert.equal(decision.intents[0]?.citation, "Gehaltsnachweise");
+      const card = deps.progress.listApartments("in_conversation").find((item) => item.scoutId === "171599833");
+      const shown = card?.mails.find((item) => item.id === "bundle");
+      assert.equal(shown?.judgmentBranch, "model");
+      assert.equal(shown?.judgmentCitation, "Gehaltsnachweise");
+      const action = deps.mail.listOpenActions().find((item) => item.mailId === "bundle");
+      assert.ok(action);
+      assert.equal(toQueueRow(action, [], deps.clock.now()).reason, "model · Gehaltsnachweise");
+    } finally {
+      close();
+    }
+  });
+
+  it("stores a rules fallback with an empty model once the read cap is spent", async () => {
+    const { deps, mailbox, close } = setup();
+    let reads = 0;
+    deps.reader = {
+      async propose() {
+        throw new Error("triage is used first");
+      },
+      async triage(): Promise<ProposedTriage> {
+        reads += 1;
+        return { intents: [], redFlags: [] };
+      },
+    };
+    try {
+      const fillers = Array.from({ length: MAIL_READINGS_PER_RUN }, (_, index) =>
+        mail({
+          id: `fill-${index}`,
+          threadId: `t-fill-${index}`,
+          from: "Landlord <haus@example.com>",
+          subject: "Hinweis",
+          sentAt: `2026-10-02T12:0${index}:00.000Z`,
+          text: "Guten Tag.",
+        }),
+      );
+      mailbox.listed = [
+        ...fillers,
+        mail({
+          id: "view",
+          threadId: "t-view",
+          from: "Landlord <haus@example.com>",
+          subject: "Termin",
+          sentAt: "2026-10-02T12:06:00.000Z",
+          text: "Die Besichtigung ist möglich. https://portal.example/slot",
+        }),
+      ];
+      await syncInbox(deps, options({ updateCursors: false }));
+      assert.equal(reads, MAIL_READINGS_PER_RUN);
+      const stored = deps.mail.judgmentsForMail("view");
+      assert.equal(stored.length, 1);
+      assert.equal(stored[0]?.source, "rules");
+      assert.equal(stored[0]?.branch, "rules_fallback");
+      assert.equal(stored[0]?.model, "");
+      const decision = JSON.parse(stored[0]?.decisionJson ?? "") as { intents: Array<{ code: string }> };
+      assert.equal(decision.intents.some((intent) => intent.code === "APPT_PROPOSAL"), true);
+    } finally {
+      close();
+    }
+  });
+
+  it("copies the listing id onto judgments when an unlinked mail is linked", async () => {
+    const { deps, mailbox, close } = setup();
+    try {
+      mailbox.listed = [
+        mail({
+          id: "ack",
+          threadId: "t-ack",
+          from: "Landlord <haus@example.com>",
+          subject: "Eingang",
+          text: "Wir haben Ihre Anfrage erhalten.",
+        }),
+      ];
+      await syncInbox(deps, options({ updateCursors: false }));
+      const before = deps.mail.judgmentsForMail("ack");
+      assert.equal(before.length, 1);
+      assert.equal(before[0]?.scoutId, "");
+      assert.equal(before[0]?.branch, "rules");
+      assert.equal(deps.mail.linkMessage("ack", "171599833", "manual"), true);
+      assert.equal(deps.mail.judgmentsForMail("ack")[0]?.scoutId, "171599833");
+    } finally {
+      close();
+    }
+  });
+
+  it("records a send confirmation as an applied listing and not a scam", async () => {
+    const { deps, mailbox, close } = setup();
+    const kept = discoverListing("111111111").filterOut("too small");
+    deps.listings.save(kept);
+    const open = discoverListing("222222222");
+    deps.listings.save(open);
+    try {
+      mailbox.listed = [
+        mail({
+          id: "sent",
+          from: "ImmoScout24 <noreply@immobilienscout24.de>",
+          subject: "Ihre persönliche Vorstellung beim Anbieter",
+          text: [
+            "Ihre Kontaktaufnahme wurde erfolgreich verschickt.",
+            "https://www.immobilienscout24.de/expose/65352507",
+            "Heesenstr. XX,",
+            "40549 Düsseldorf",
+            "Über eine virtuelle Besichtigung würde ich mich freuen.",
+            "Ein Wohnberechtigungsschein (WBS) liegt vor.",
+            "SCHUFA-BonitätsCheck anfordern",
+          ].join("\n"),
+        }),
+        mail({
+          id: "kept",
+          from: "ImmoScout24 <noreply@immobilienscout24.de>",
+          subject: "Ihre persönliche Vorstellung beim Anbieter",
+          text: "Ihre Kontaktaufnahme wurde erfolgreich verschickt.\nhttps://www.immobilienscout24.de/expose/111111111",
+        }),
+        mail({
+          id: "open",
+          from: "ImmoScout24 <noreply@immobilienscout24.de>",
+          subject: "Ihre persönliche Vorstellung beim Anbieter",
+          text: "Ihre Kontaktaufnahme wurde erfolgreich verschickt.\nhttps://www.immobilienscout24.de/expose/222222222",
+        }),
+      ];
+      await syncInbox(deps, options({ updateCursors: false }));
+      const created = deps.listings.findById("65352507");
+      assert.equal(created?.status, "APPLIED");
+      assert.equal(created?.address, "Heesenstr. XX, 40549 Düsseldorf");
+      assert.equal(deps.listings.findById("111111111")?.status, "FILTERED_OUT");
+      assert.equal(deps.listings.findById("222222222")?.status, "APPLIED");
+      assert.equal(deps.progress.stageOf("65352507"), "applied");
+      assert.equal(deps.mail.judgmentsForMail("sent").length, 0);
+      assert.equal(deps.mail.listOpenActions().some((row) => row.mailId === "sent"), false);
+    } finally {
+      close();
+    }
+  });
+
+  it("stores a backfill batch before the next one and skips ids already stored", async () => {
+    const { deps, mailbox, close } = setup();
+    try {
+      mailbox.listed = [mail({ id: "old" }), mail({ id: "new" })];
+      const first = await syncInbox(deps, options());
+      assert.equal(first.mail, 2);
+      assert.equal(deps.accounts.load()?.gmailHistoryId, "h-new");
+      mailbox.expired = true;
+      mailbox.listed = [mail({ id: "old" }), mail({ id: "new" }), mail({ id: "later", threadId: "t-later" })];
+      const second = await syncInbox(deps, options());
+      assert.equal(second.mail, 1);
+      assert.equal(mailbox.skips.at(-1)?.has("old"), true);
+      assert.equal(mailbox.skips.at(-1)?.has("new"), true);
+      assert.equal(deps.accounts.load()?.gmailHistoryId, "h-new");
+    } finally {
+      close();
+    }
+  });
+
+  it("does not save a history cursor when the backfill stops", async () => {
+    const { deps, mailbox, close } = setup();
+    try {
+      mailbox.failList = true;
+      mailbox.listed = [mail({})];
+      await assert.rejects(() => syncInbox(deps, options()), /backfill stopped/);
+      assert.equal(deps.accounts.load()?.gmailHistoryId, null);
+      assert.equal(deps.mail.storedGmailIds().size, 0);
     } finally {
       close();
     }

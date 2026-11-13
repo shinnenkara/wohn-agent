@@ -2,15 +2,18 @@ import { existsSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
 import { loadDotEnv } from "../adapters/config/dotenv.js";
-import { openReadOnlyDatabase } from "../adapters/sqlite/database.js";
+import { loadGoogleConfig } from "../adapters/config/google-env.js";
+import { openDatabase, openReadOnlyDatabase } from "../adapters/sqlite/database.js";
 import { SqliteMailStore } from "../adapters/sqlite/mail-store.js";
 import { SqliteProgressLog } from "../adapters/sqlite/progress-log.js";
 import { buildFlow } from "../domain/funnel.js";
 import { isFunnelStage } from "../domain/progress.js";
-import { linkUnlinkedMail } from "./link-route.js";
+import { composeConsole, type ConsoleApplication } from "./compose-console.js";
+import { hideUnlinkedMail, linkUnlinkedMail } from "./link-route.js";
 import { queueExposeRefresh } from "./refresh-route.js";
 import { repairStoredAddresses } from "./repair-addresses.js";
 import { repairStoredMailText } from "./repair-mail-text.js";
+import { listTasks, runTask } from "./task-route.js";
 import { progressPage } from "./ui-page.js";
 
 const PORT = 8787;
@@ -23,6 +26,7 @@ function main(): void {
     process.exitCode = 1;
     return;
   }
+  openDatabase(databasePath).close();
   correctStoredAddresses(databasePath);
   correctStoredMail(databasePath);
   const db = openReadOnlyDatabase(databasePath);
@@ -36,8 +40,18 @@ function main(): void {
   }
   const progress = new SqliteProgressLog(db);
   const mail = new SqliteMailStore(db);
+  let tasks: ConsoleApplication;
+  try {
+    tasks = composeConsole(loadGoogleConfig());
+  } catch (error) {
+    db.close();
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message}\n`);
+    process.exitCode = 1;
+    return;
+  }
   const server = createServer((request, response) => {
-    void route(request, response, progress, mail, databasePath).catch((error: unknown) => {
+    void route(request, response, progress, mail, tasks, databasePath).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
       process.stderr.write(`${message}\n`);
       if (!response.headersSent) {
@@ -51,6 +65,7 @@ function main(): void {
   const stop = () => {
     server.close();
     db.close();
+    tasks.shutdown();
   };
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
@@ -61,11 +76,25 @@ async function route(
   response: ServerResponse,
   progress: SqliteProgressLog,
   mail: SqliteMailStore,
+  tasks: ConsoleApplication,
   databasePath: string,
 ): Promise<void> {
   const url = new URL(request.url ?? "/", "http://127.0.0.1");
+  if (request.method === "GET" && url.pathname === "/api/tasks") {
+    const result = listTasks(tasks.session);
+    send(response, result.status, result.type, result.body);
+    return;
+  }
+  if (request.method === "POST" && url.pathname.startsWith("/api/tasks/")) {
+    await taskRequest(request, response, tasks, url.pathname.slice("/api/tasks/".length));
+    return;
+  }
   if (request.method === "POST" && url.pathname === "/api/apartments/refresh") {
     refreshApartment(response, progress, databasePath, url.searchParams.get("id") ?? "");
+    return;
+  }
+  if (request.method === "POST" && url.pathname === "/api/unlinked/hide") {
+    await hideRequest(request, response, databasePath);
     return;
   }
   if (request.method === "POST" && url.pathname === "/api/unlinked/link") {
@@ -81,7 +110,10 @@ async function route(
     return;
   }
   if (url.pathname === "/api/flow") {
-    sendJson(response, buildFlow(progress.listStages(), progress.listTransitions()));
+    sendJson(response, {
+      ...buildFlow(progress.listStages()),
+      closed: progress.closedCount(),
+    });
     return;
   }
   if (url.pathname === "/api/apartments/image") {
@@ -101,6 +133,14 @@ async function route(
   }
   if (url.pathname === "/api/apartments") {
     const stage = url.searchParams.get("stage") ?? "";
+    if (stage === "") {
+      sendJson(response, progress.listAllApartments());
+      return;
+    }
+    if (stage === "closed") {
+      sendJson(response, progress.listClosed());
+      return;
+    }
     if (!isFunnelStage(stage)) {
       send(response, 400, "text/plain; charset=utf-8", "Unknown stage");
       return;
@@ -110,12 +150,61 @@ async function route(
   }
   if (url.pathname === "/api/unlinked") {
     sendJson(response, {
-      mail: mail.listUnlinkedMail(20),
+      mail: mail.listUnlinkedMail(20, url.searchParams.get("hidden") === "1"),
       events: mail.listUnlinkedEvents(20),
     });
     return;
   }
   send(response, 404, "text/plain; charset=utf-8", "Not found");
+}
+
+async function taskRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  tasks: ConsoleApplication,
+  action: string,
+): Promise<void> {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(await readBody(request));
+  } catch {
+    send(response, 400, "text/plain; charset=utf-8", "Unknown task");
+    return;
+  }
+  const record = payload !== null && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
+  const id = taskId(record.id);
+  if (id === null) {
+    send(response, 400, "text/plain; charset=utf-8", "Unknown task");
+    return;
+  }
+  const result = await runTask(tasks.session, action, id);
+  send(response, result.status, result.type, result.body);
+}
+
+function taskId(value: unknown): number | null {
+  const id = typeof value === "number" ? value : typeof value === "string" && value.trim() !== "" ? Number(value) : Number.NaN;
+  if (!Number.isInteger(id) || id <= 0) {
+    return null;
+  }
+  return id;
+}
+
+async function hideRequest(request: IncomingMessage, response: ServerResponse, databasePath: string): Promise<void> {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(await readBody(request));
+  } catch {
+    send(response, 400, "text/plain; charset=utf-8", "Unknown mail");
+    return;
+  }
+  const record = payload !== null && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
+  const gmailId = typeof record.gmailId === "string" ? record.gmailId.trim() : "";
+  if (typeof record.hidden !== "boolean") {
+    send(response, 400, "text/plain; charset=utf-8", "Unknown mail");
+    return;
+  }
+  const result = hideUnlinkedMail(databasePath, gmailId, record.hidden);
+  send(response, result.status, result.type, result.body);
 }
 
 async function linkRequest(request: IncomingMessage, response: ServerResponse, databasePath: string): Promise<void> {

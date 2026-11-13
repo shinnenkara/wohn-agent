@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { readGmailMessage } from "../../src/adapters/google/gmail-message.js";
+import { listPdfParts, readGmailMessage } from "../../src/adapters/google/gmail-message.js";
 
 describe("gmail message", () => {
   it("reads the text part and a calendar attachment", () => {
@@ -31,5 +31,29 @@ describe("gmail message", () => {
     assert.equal(parsed.inReplyTo, "<parent@example.com>");
     assert.equal(parsed.references, "<root@example.com> <parent@example.com>");
     assert.equal(parsed.sentAt, new Date(1760000000000).toISOString());
+  });
+
+  it("lists pdf parts and keeps inline bytes", () => {
+    const parts = listPdfParts({
+      payload: {
+        parts: [
+          { mimeType: "text/plain", body: { data: Buffer.from("Hallo", "utf8").toString("base64url") } },
+          {
+            mimeType: "application/pdf",
+            filename: "Mietvertrag.pdf",
+            body: { attachmentId: "att-1" },
+          },
+          {
+            mimeType: "application/octet-stream",
+            filename: "Nebenkosten.pdf",
+            body: { data: Buffer.from("%PDF", "utf8").toString("base64url") },
+          },
+        ],
+      },
+    });
+    assert.equal(parts.length, 2);
+    assert.equal(parts[0]?.attachmentId, "att-1");
+    assert.equal(parts[1]?.filename, "Nebenkosten.pdf");
+    assert.match(parts[1]?.attachmentId ?? "", /^inline:/);
   });
 });

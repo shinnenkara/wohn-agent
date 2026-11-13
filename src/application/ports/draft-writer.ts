@@ -1,3 +1,8 @@
+export interface ReplyAttachment {
+  filename: string;
+  content: Uint8Array;
+}
+
 export interface ReplyDraft {
   threadId: string;
   to: string;
@@ -5,6 +10,7 @@ export interface ReplyDraft {
   body: string;
   inReplyTo: string;
   references: string;
+  attachment?: ReplyAttachment;
 }
 
 export interface DraftWriter {

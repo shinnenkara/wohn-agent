@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { gmailDraftUrl, gmailInboxUrl } from "../../src/domain/gmail-url.js";
-import { commandsFrom, effectFor, renderConsole, shouldBell } from "../../src/domain/console-screen.js";
+import { listTasks } from "../../src/infrastructure/task-route.js";
+import type { ConsoleSession } from "../../src/infrastructure/console-loop.js";
 import {
   planActions,
   queueBadges,
@@ -29,6 +30,22 @@ function intent(code: IntentCode, link = ""): KeptIntent {
   };
 }
 
+function taskSession(rows: QueueRow[], now: Date): ConsoleSession {
+  return {
+    queue: () => rows,
+    setStatus() {
+      return undefined;
+    },
+    quarantine() {
+      return undefined;
+    },
+    async createDraft() {
+      return { url: "", notice: "" };
+    },
+    now: () => now,
+  };
+}
+
 function row(patch: Partial<QueueRow> & Pick<QueueRow, "id" | "priority" | "deadlineAt">): QueueRow {
   return {
     scoutId: "171599833",
@@ -38,6 +55,10 @@ function row(patch: Partial<QueueRow> & Pick<QueueRow, "id" | "priority" | "dead
     badges: [],
     actionUrl: "https://portal.example/book",
     draftResponseText: "Gerne.",
+    otherBody: "",
+    declineBody: "",
+    declineLabel: "Decline",
+    reason: "",
     ...patch,
   };
 }
@@ -150,7 +171,7 @@ describe("mail actions", () => {
     assert.equal(gmailDraftUrl("msg-9", "a@example.com").includes("#drafts?compose=msg-9"), true);
   });
 
-  it("renders the selected row and maps keys to a status", () => {
+  it("lists countdown, priority, and badges for the tasks tab", () => {
     const now = new Date("2026-11-12T16:00:00.000Z");
     const open = row({
       id: 7,
@@ -158,24 +179,20 @@ describe("mail actions", () => {
       deadlineAt: "2026-11-12T16:14:00.000Z",
       badges: ["WBM", "CONFLICT"],
     });
-    const screen = renderConsole({ rows: [open], selected: 0, now, notice: "" });
-    assert.equal(screen.includes("> 14m"), true);
-    assert.equal(screen.includes("P0"), true);
-    assert.equal(screen.includes("WBM CONFLICT"), true);
-    assert.equal(screen.includes("o open"), true);
-    assert.equal(renderConsole({ rows: [], selected: 0, now, notice: "" }).includes("No open actions."), true);
-
-    assert.deepEqual(commandsFrom("\x1b[A\x1b[Bq"), ["up", "down", "q"]);
-    assert.equal(effectFor("c", [open], 0).effect.kind, "complete");
-    assert.deepEqual(effectFor("o", [open], 0).effect, { kind: "open", id: 7, url: open.actionUrl });
-    assert.equal(effectFor("s", [open], 0).effect.kind, "quarantine");
-    assert.equal(effectFor("d", [open], 0).effect.kind, "draft");
-    assert.equal(effectFor("d", [{ ...open, draftResponseText: "" }], 0).effect.kind, "note");
-    assert.equal(effectFor("q", [open], 0).effect.kind, "quit");
-    assert.equal(effectFor("down", [open, { ...open, id: 8 }], 0).selected, 1);
-    assert.equal(shouldBell(false, new Set(), [open]), false);
-    assert.equal(shouldBell(true, new Set(), [open]), true);
-    assert.equal(shouldBell(true, new Set([7]), [open]), false);
+    const listed = JSON.parse(listTasks(taskSession([open], now)).body) as Array<{
+      countdown: string;
+      shortPriority: string;
+      title: string;
+      label: string;
+      badges: string[];
+    }>;
+    assert.equal(listed.length, 1);
+    assert.equal(listed[0]?.countdown, "14m");
+    assert.equal(listed[0]?.shortPriority, "P0");
+    assert.equal(listed[0]?.title, "Open booking link");
+    assert.equal(listed[0]?.label, "Badstraße 54");
+    assert.deepEqual(listed[0]?.badges, ["WBM", "CONFLICT"]);
+    assert.equal(listTasks(taskSession([], now)).body, "[]");
     const shown = toQueueRow(
       {
         id: 7,

@@ -46,6 +46,14 @@ export interface ListingData {
   sentMessage: string;
 }
 
+export interface SentFacts {
+  title: string | null;
+  address: string | null;
+  priceCold: number | null;
+  rooms: number | null;
+  areaSqm: number | null;
+}
+
 const TRANSITIONS: Record<ListingStatus, readonly ListingStatus[]> = {
   DISCOVERED: ["FILTERED_OUT", "APPLYING", "MANUAL_REQUIRED"],
   APPLYING: ["APPLIED", "FAILED", "MANUAL_REQUIRED", "DISCOVERED"],
@@ -235,6 +243,66 @@ export class Listing {
       description: details.description ?? null,
       snapshot: details.snapshot ?? null,
       isPlusOnly: details.isPlusOnly,
+    });
+  }
+
+  rememberSent(appliedAt: Date, facts: SentFacts): Listing | null {
+    if (this.data.status !== "DISCOVERED" && this.data.status !== "APPLYING") {
+      return null;
+    }
+    return new Listing({
+      ...this.data,
+      status: "APPLIED",
+      appliedAt,
+      errorCode: null,
+      title: this.data.title ?? facts.title,
+      address: this.data.address ?? facts.address,
+      priceCold: this.data.priceCold ?? facts.priceCold,
+      rooms: this.data.rooms ?? facts.rooms,
+      areaSqm: this.data.areaSqm ?? facts.areaSqm,
+    });
+  }
+
+  static sentApplication(input: {
+    scoutId: string;
+    url: string;
+    appliedAt: Date;
+    title?: string | null;
+    address?: string | null;
+    priceCold?: number | null;
+    rooms?: number | null;
+    areaSqm?: number | null;
+  }): Listing {
+    const scoutId = input.scoutId.trim();
+    if (!scoutId) {
+      throw new DomainError("scoutId is required");
+    }
+    return new Listing({
+      scoutId,
+      url: input.url,
+      title: textOrNull(input.title, 300),
+      salutation: null,
+      priceCold: amountOrNull(input.priceCold),
+      rooms: amountOrNull(input.rooms),
+      areaSqm: amountOrNull(input.areaSqm),
+      address: textOrNull(input.address, 200),
+      priceWarm: null,
+      extraCosts: null,
+      deposit: null,
+      floor: null,
+      moveIn: null,
+      description: null,
+      snapshot: null,
+      energyClass: null,
+      previewImage: null,
+      isPlusOnly: false,
+      status: "APPLIED",
+      filterReason: null,
+      errorCode: null,
+      retryCount: 0,
+      discoveredAt: input.appliedAt,
+      appliedAt: input.appliedAt,
+      sentMessage: "",
     });
   }
 

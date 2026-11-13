@@ -13,6 +13,7 @@ export interface MailTriageInput {
   subject: string;
   body: string;
   stage: FunnelStage | null;
+  outbound: boolean;
 }
 
 export class MailReaderRateLimit extends Error {

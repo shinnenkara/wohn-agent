@@ -8,3 +8,8 @@ for (const name of readdirSync(source)) {
     cpSync(`${source}/${name}`, `${target}/${name}`);
   }
 }
+
+const fontDir = "dist/adapters/pdf";
+mkdirSync(fontDir, { recursive: true });
+cpSync("src/adapters/pdf/NotoSans-Regular.ttf", `${fontDir}/NotoSans-Regular.ttf`);
+cpSync("src/adapters/pdf/OFL.txt", `${fontDir}/OFL.txt`);

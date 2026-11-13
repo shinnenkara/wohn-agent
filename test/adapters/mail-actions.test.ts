@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import { openDatabase } from "../../src/adapters/sqlite/database.js";
 import { SqliteMailStore } from "../../src/adapters/sqlite/mail-store.js";
 import { materializeActions } from "../../src/application/materialize-actions.js";
+import { noteDocumentCompleted } from "../../src/application/queue-erasure.js";
 import type { StoredMail } from "../../src/application/ports/mail-store.js";
 import { ACTION_TEMPLATES } from "../../src/domain/mail-action.js";
 import type { KeptIntent, IntentCode } from "../../src/domain/triage.js";
@@ -169,11 +170,143 @@ describe("action store", () => {
           notify: true,
           blocked: false,
           draft: null,
+          relevance: "possible",
         },
         createdAt: now,
       });
       assert.equal(store.listActions().length, 0);
       assert.equal(store.isQuarantined(""), false);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("queues a deletion draft 30 days after a completed document send", () => {
+    const db = openDatabase(":memory:");
+    const store = new SqliteMailStore(db);
+    const sent = new Date("2026-11-12T16:00:00.000Z");
+    try {
+      store.insertMail(mail("docs", "171599833"), sent);
+      store.insertMail(mail("no", "171599833"), sent);
+      db.prepare("INSERT INTO listings (scout_id, url, status, address) VALUES (?, ?, 'APPLIED', ?)").run(
+        "171599833",
+        "https://example.test/171599833",
+        "Badstraße 4",
+      );
+      store.saveTriage(
+        "no",
+        [{ code: "REJECTION", confidence: 1, summary: "Absage", metadataJson: "{}", dskViolation: false }],
+        { level: "SAFE", redFlagsJson: "[]", relevance: "possible" },
+      );
+      materializeActions(store, {
+        scoutId: "171599833",
+        mailId: "no",
+        sentAt: sent.toISOString(),
+        accountEmail: null,
+        draftBody: "",
+        decision: {
+          intents: [intent("REJECTION")],
+          riskLevel: "SAFE",
+          redFlags: [],
+          priority: "P3_SILENT",
+          notify: false,
+          blocked: false,
+          draft: null,
+          relevance: "possible",
+        },
+        createdAt: sent,
+      });
+      assert.equal(store.listActions().some((action) => action.actionCode === "REQUEST_ERASURE"), false);
+      store.insertAction({
+        scoutId: "171599833",
+        mailId: "docs",
+        intentCode: "DOC_PACKAGE_REQ",
+        actionCode: "SEND_DOCUMENTS",
+        status: "PENDING",
+        priority: "P1_HIGH",
+        actionUrl: "",
+        draftResponseText: "Gerne.",
+        deadlineAt: "2026-11-13T16:00:00.000Z",
+        createdAt: sent,
+      });
+      const open = store.listActions().find((action) => action.actionCode === "SEND_DOCUMENTS");
+      assert.ok(open);
+      store.setActionStatus(open.id, "COMPLETED");
+      noteDocumentCompleted(store, open.id, sent);
+      const queued = store.listActions().find((action) => action.actionCode === "REQUEST_ERASURE");
+      assert.equal(queued?.status, "SCHEDULED");
+      assert.equal(queued?.deadlineAt, new Date(sent.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString());
+      assert.match(queued?.draftResponseText ?? "", /Art\. 17 DSGVO/);
+      assert.match(queued?.draftResponseText ?? "", /Badstraße 4/);
+      assert.equal(store.listOpenActions().some((action) => action.actionCode === "REQUEST_ERASURE"), false);
+      store.promoteDueErasure(new Date(sent.getTime() + 30 * 24 * 60 * 60 * 1000));
+      const shown = store.listOpenActions().find((action) => action.actionCode === "REQUEST_ERASURE");
+      assert.equal(shown?.title, "Request data deletion");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("keeps the requested documents and the phase A flag on the open action", () => {
+    const db = openDatabase(":memory:");
+    const store = new SqliteMailStore(db);
+    const now = new Date("2026-11-12T16:00:00.000Z");
+    try {
+      store.insertMail(mail("docs", "171599833"), now);
+      store.saveTriage(
+        "docs",
+        [
+          {
+            code: "DOC_PACKAGE_REQ",
+            confidence: 1,
+            summary: "Unterlagen",
+            metadataJson: JSON.stringify({
+              requestedDocuments: ["WBS", "SCHUFA_BONITAETSCHECK"],
+              proposedSlots: [],
+            }),
+            dskViolation: true,
+          },
+        ],
+        { level: "WARN_DSGVO_VIOLATION", redFlagsJson: "[]", relevance: "possible" },
+      );
+      store.insertAction({
+        scoutId: "171599833",
+        mailId: "docs",
+        intentCode: "DOC_PACKAGE_REQ",
+        actionCode: "SEND_DOCUMENTS",
+        status: "PENDING",
+        priority: "P1_HIGH",
+        actionUrl: "",
+        draftResponseText: "Gerne.",
+        deadlineAt: "2026-11-13T16:00:00.000Z",
+        createdAt: now,
+      });
+      const open = store.listOpenActions()[0];
+      assert.deepEqual(open?.requestedDocuments, ["WBS", "SCHUFA_BONITAETSCHECK"]);
+      assert.equal(open?.dskViolation, true);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("hides a mail by hand and puts an unrelated row back on the main list", () => {
+    const db = openDatabase(":memory:");
+    const store = new SqliteMailStore(db);
+    const now = new Date("2026-11-12T16:00:00.000Z");
+    try {
+      store.insertMail(mail("unread", ""), now);
+      store.insertMail({ ...mail("noise", ""), sentAt: "2026-11-12T15:00:00.000Z" }, now);
+      store.saveTriage("noise", [], { level: "SAFE", redFlagsJson: "[]", relevance: "unrelated" });
+      assert.equal(store.setOperatorList("unread", true), true);
+      assert.equal(store.listUnlinkedMail(20).some((item) => item.id === "unread"), false);
+      const hidden = store.listUnlinkedMail(20, true).find((item) => item.id === "unread");
+      assert.equal(hidden?.concealed, true);
+      assert.equal(store.setOperatorList("noise", false), true);
+      const shown = store.listUnlinkedMail(20).find((item) => item.id === "noise");
+      assert.equal(shown?.concealed, false);
+      assert.equal(shown?.relevance, "unrelated");
+      store.saveTriage("unread", [], { level: "SAFE", redFlagsJson: "[]", relevance: "possible" });
+      assert.equal(store.listUnlinkedMail(20).some((item) => item.id === "unread"), false);
     } finally {
       db.close();
     }

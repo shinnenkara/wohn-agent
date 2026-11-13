@@ -236,7 +236,9 @@ export async function runTick(
           message: errorMessage(error),
         });
       }
-      await deps.clock.sleep(betweenListingDelayMs(deps.random), signal);
+      const waitMs = betweenListingDelayMs(deps.random);
+      deps.logger.info(`waiting ${Math.round(waitMs / 1000)}s before the next listing`, { sleepMs: waitMs });
+      await deps.clock.sleep(waitMs, signal);
     }
     return tickState;
   } catch (error) {

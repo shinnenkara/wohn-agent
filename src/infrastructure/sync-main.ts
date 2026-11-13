@@ -6,7 +6,7 @@ import { composeSync, type SyncApplication } from "./compose-sync.js";
 async function main(): Promise<void> {
   const since = parseSinceFlag(process.argv);
   const watch = process.argv.includes("--watch");
-  const app = composeSync(loadGoogleConfig());
+  const app = await composeSync(loadGoogleConfig());
   if (since) {
     process.stdout.write(`Since ${formatDay(since)}.\n`);
   }

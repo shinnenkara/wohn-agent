@@ -5,10 +5,12 @@ import {
   INTENT_CODES,
   INTENT_PRIORITY,
   confirmTriage,
+  decisionFromStored,
   draftIntentFor,
   dskPhase,
   proposeFromRules,
   rulesSkipModel,
+  settleRelevance,
   type ProposedTriage,
 } from "../../src/domain/triage.js";
 
@@ -18,7 +20,7 @@ function proposed(patch: Partial<ProposedTriage> = {}): ProposedTriage {
 
 describe("triage firewall", () => {
   it("assigns priority from the intent code", () => {
-    assert.equal(INTENT_CODES.length, 12);
+    assert.equal(INTENT_CODES.length, 14);
     assert.equal(INTENT_PRIORITY.PORTAL_INVITE_LINK, "P0_CRITICAL");
     assert.equal(INTENT_PRIORITY.DOC_PACKAGE_REQ, "P1_HIGH");
     assert.equal(INTENT_PRIORITY.SCAM_SUSPECTED, "P2_WARNING");
@@ -219,5 +221,97 @@ describe("triage firewall", () => {
     });
     assert.equal(decision.intents[0]?.code, "IS24_AUTO_ACK");
     assert.equal(decision.notify, false);
+    assert.equal(decision.relevance, "possible");
+  });
+
+  it("keeps an ImmoScout send confirmation as a receipt at stage applied", () => {
+    const subject = "Ihre persönliche Vorstellung beim Anbieter";
+    const body = [
+      "Ihre Kontaktaufnahme wurde erfolgreich verschickt.",
+      "Über eine virtuelle Besichtigung würde ich mich freuen.",
+      "Ein Wohnberechtigungsschein (WBS) liegt vor.",
+      "SCHUFA-BonitätsCheck anfordern",
+    ].join("\n");
+    const classification = classifyReply(subject, body, null);
+    assert.equal(classification?.intent, "receipt");
+    assert.equal(rulesSkipModel(subject, body, classification), true);
+    const decision = confirmTriage({
+      text: `${subject}\n${body}`,
+      stage: "applied",
+      proposed: proposeFromRules({
+        from: "ImmoScout24 <noreply@immobilienscout24.de>",
+        subject,
+        body,
+        classification: classification ?? { intent: "receipt", relation: null, topic: null, evidence: "" },
+      }),
+    });
+    assert.equal(decision.riskLevel, "SAFE");
+    assert.equal(decision.draft?.intent, "receipt");
+    assert.equal(decision.intents.some((intent) => intent.code === "IS24_AUTO_ACK"), true);
+    assert.equal(decision.intents.some((intent) => intent.code === "SCAM_SUSPECTED"), false);
+    const viewing = proposeFromRules({
+      from: "Landlord <haus@example.com>",
+      subject: "Termin",
+      body: "Kommen Sie zur Besichtigung. SCHUFA-BonitätsCheck",
+      classification: { intent: "viewing_schedule", relation: "start", topic: "viewing", evidence: "besichtigung" },
+    });
+    assert.deepEqual(viewing.intents[0]?.requestedDocuments, []);
+  });
+
+  it("hides only an explicit unrelated reading that kept no intent", () => {
+    assert.equal(settleRelevance("unrelated", 0), "unrelated");
+    assert.equal(settleRelevance("unrelated", 1), "possible");
+    assert.equal(settleRelevance("", 0), "possible");
+    const hidden = confirmTriage({
+      text: "Your mileage balance.",
+      stage: null,
+      proposed: proposed({ relevance: "unrelated" }),
+    });
+    assert.equal(hidden.relevance, "unrelated");
+    assert.equal(hidden.intents.length, 0);
+    const cited = confirmTriage({
+      text: "Absage des Termins",
+      stage: null,
+      proposed: proposed({
+        relevance: "unrelated",
+        intents: [
+          {
+            code: "REJECTION",
+            confidence: 0.2,
+            summary: "cancel",
+            citation: "Absage",
+            deepLink: "",
+            linkCitation: "",
+            requestedDocuments: [],
+            proposedSlots: [],
+          },
+        ],
+      }),
+    });
+    assert.equal(cited.relevance, "possible");
+    assert.equal(cited.intents[0]?.code, "REJECTION");
+    assert.equal(cited.intents[0]?.confidence, 0.2);
+    const restored = decisionFromStored({
+      intents: [
+        {
+          code: "APPT_PROPOSAL",
+          confidence: 0.7,
+          summary: "slot",
+          metadataJson: JSON.stringify({
+            citation: "Montag",
+            actionDeepLink: null,
+            linkCitation: null,
+            requestedDocuments: [],
+            proposedSlots: [],
+          }),
+          dskViolation: false,
+        },
+      ],
+      riskLevel: "SAFE",
+      redFlags: [],
+      relevance: "possible",
+    });
+    assert.equal(restored.draft?.intent, "viewing_schedule");
+    assert.equal(restored.intents[0]?.confidence, 0.7);
   });
 });

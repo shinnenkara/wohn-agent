@@ -5,6 +5,7 @@ export interface AgendaEvent {
   start: string;
   end: string;
   place: string;
+  cancelled?: boolean;
 }
 
 export interface AgendaPage {

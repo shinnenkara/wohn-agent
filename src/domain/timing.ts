@@ -76,7 +76,7 @@ export function pollIntervalMs(random: RandomSource, baseMs = 60_000): number {
 }
 
 export function betweenListingDelayMs(random: RandomSource): number {
-  return Math.round(8_000 + random.next() * 12_000);
+  return Math.round(60_000 + random.next() * 60_000);
 }
 
 export function captchaCooldownMs(random: RandomSource): number {

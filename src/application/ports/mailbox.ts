@@ -13,8 +13,13 @@ export interface FetchedMail {
   calendarPart: boolean;
 }
 
+export interface MailListOptions {
+  skip?: ReadonlySet<string>;
+  onBatch?: (mails: readonly FetchedMail[]) => Promise<void>;
+}
+
 export interface Mailbox {
   historyId(): Promise<string>;
-  listSince(since: Date, till: Date | null): Promise<FetchedMail[]>;
+  listSince(since: Date, till: Date | null, options?: MailListOptions): Promise<FetchedMail[]>;
   addedSince(startId: string): Promise<{ mails: FetchedMail[]; latestId: string; expired: boolean }>;
 }

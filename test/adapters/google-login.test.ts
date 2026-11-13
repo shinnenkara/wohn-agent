@@ -8,7 +8,7 @@ import { createAuthorizer } from "../../src/adapters/google/authorizer.js";
 import { googleEndpoint, loadGoogleCredentials } from "../../src/adapters/google/google-credentials.js";
 import { SqliteAccountStore } from "../../src/adapters/sqlite/account-store.js";
 import { openDatabase } from "../../src/adapters/sqlite/database.js";
-import { linkGoogle } from "../../src/infrastructure/login-main.js";
+import { linkGoogle, ensureStoredAccount } from "../../src/infrastructure/login-main.js";
 
 describe("google login", () => {
   it("reads a device token and ignores a missing file", () => {
@@ -160,6 +160,36 @@ describe("google login", () => {
       now: () => new Date("2026-11-06T01:00:00.000Z"),
     });
     await assert.rejects(() => authorizer.accessToken(), /Google login expired\. Run npm run login\./);
+  });
+
+  it("stores the linked email when the account row is missing", async () => {
+    const db = openDatabase(":memory:");
+    const accounts = new SqliteAccountStore(db);
+    try {
+      await ensureStoredAccount({
+        accounts,
+        googleUrl: "https://google.example/",
+        deviceToken: "device-token",
+        now: new Date("2026-11-13T12:00:00.000Z"),
+        fetchImpl: async (input) => {
+          assert.equal(String(input), "https://google.example/v1/session");
+          return Response.json({ linked: true, email: "a@example.com" });
+        },
+      });
+      assert.equal(accounts.load()?.email, "a@example.com");
+      await ensureStoredAccount({
+        accounts,
+        googleUrl: "https://google.example/",
+        deviceToken: "device-token",
+        now: new Date("2026-11-13T12:00:00.000Z"),
+        fetchImpl: async () => {
+          throw new Error("should not ask again");
+        },
+      });
+      assert.equal(accounts.load()?.email, "a@example.com");
+    } finally {
+      db.close();
+    }
   });
 });
 

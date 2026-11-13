@@ -1,0 +1,1 @@
+ALTER TABLE mail ADD COLUMN operator_list TEXT NOT NULL DEFAULT '';

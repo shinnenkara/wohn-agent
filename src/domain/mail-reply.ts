@@ -7,6 +7,8 @@ export const MAIL_INTENTS = [
   "viewing_schedule",
   "viewing_confirm",
   "viewing_followup",
+  "cancelled_by_us",
+  "slot_cancelled",
   "waitlist",
   "contract_schedule",
   "contract_confirm",
@@ -50,6 +52,7 @@ export interface BusyInterval {
 export interface DraftText {
   body: string;
   altBody: string;
+  otherBody: string;
 }
 
 export const COMPOSE_URL_LIMIT = 1800;
@@ -73,6 +76,30 @@ const SOFT_PHRASES = [
   "zur kenntnis genommen",
   "wir haben ihre nachricht",
 ];
+
+const OUR_CANCEL_PHRASES = [
+  "ihre absage",
+  "sie haben den termin abgesagt",
+  "ihre stornierung",
+  "ich sage den termin ab",
+  "ich sage den besichtigungstermin ab",
+  "ich muss den termin absagen",
+  "ich möchte den termin absagen",
+  "ich moechte den termin absagen",
+];
+
+const SLOT_CANCEL_PHRASES = [
+  "termin entfällt",
+  "termin entfaellt",
+  "besichtigung muss entfallen",
+  "besichtigung entfällt",
+  "besichtigung entfaellt",
+  "termin wurde abgesagt",
+  "besichtigungstermin abgesagt",
+  "besichtigung wurde abgesagt",
+];
+
+const DECLINE_APPOINTMENT = "Bitte sagen Sie den Termin ab.";
 
 const REJECTION_PHRASES = [
   "bereits vergeben",
@@ -109,6 +136,12 @@ const RECEIPT_PHRASES = [
   "bewerbung erhalten",
   "vielen dank für ihre bewerbung",
   "vielen dank für ihre anfrage",
+];
+
+const PORTAL_RECEIPT_PHRASES = [
+  "persönliche vorstellung beim anbieter",
+  "kontaktaufnahme wurde erfolgreich verschickt",
+  "anfrage versendet",
 ];
 
 const DOCUMENT_PHRASES = [
@@ -200,6 +233,8 @@ export function topicOfIntent(intent: string): MailTopic | null {
     case "viewing_schedule":
     case "viewing_confirm":
     case "viewing_followup":
+    case "cancelled_by_us":
+    case "slot_cancelled":
       return "viewing";
     case "contract_schedule":
     case "contract_confirm":
@@ -216,9 +251,22 @@ export function topicOfIntent(intent: string): MailTopic | null {
 
 export function classifyReply(subject: string, body: string, open: OpenTopic | null): MailClassification | null {
   const text = haystack(subject, body);
+  const ours = findPhrase(text, OUR_CANCEL_PHRASES);
+  if (ours) {
+    const topic = open?.topic === "contract" ? "contract" : "viewing";
+    return { intent: "cancelled_by_us", relation: "close", topic, evidence: ours };
+  }
   const rejection = findPhrase(text, REJECTION_PHRASES);
   if (rejection) {
     return closeTopic(open, rejection);
+  }
+  const slot = findPhrase(text, SLOT_CANCEL_PHRASES);
+  if (slot) {
+    return applyMilestone(open, { intent: "slot_cancelled", evidence: slot });
+  }
+  const portal = findPhrase(text, PORTAL_RECEIPT_PHRASES);
+  if (portal) {
+    return { intent: "receipt", relation: null, topic: null, evidence: portal };
   }
   const found = milestone(text, body);
   const continuation = findPhrase(text, CONTINUE_PHRASES) || findPhrase(text, SOFT_PHRASES);
@@ -314,43 +362,52 @@ export function renderDraft(input: {
   contactName: string | null;
   slots: readonly Date[];
   visit: CitedSlot | null;
+  documentLabels?: readonly string[];
 }): DraftText | null {
   const text = haystack(input.subject, input.body);
   if (findPhrase(text, REJECTION_PHRASES)) {
     return null;
   }
   const intent = input.classification.intent;
-  if (intent === "receipt" || intent === "unknown") {
+  if (intent === "receipt" || intent === "unknown" || intent === "cancelled_by_us") {
     return null;
   }
   if (input.classification.relation === "continue" && quiet(text)) {
     return null;
   }
   if (intent === "viewing_confirm" || intent === "contract_confirm") {
-    return confirmDraft(input.contactName, intent, input.visit);
+    return confirmDraft(input.contactName, intent, input.visit, input.slots);
   }
-  if (intent === "viewing_schedule" || intent === "contract_schedule") {
-    return { body: letter(input.contactName, scheduleParagraph(intent, input.slots)), altBody: "" };
+  if (intent === "viewing_schedule" || intent === "contract_schedule" || intent === "slot_cancelled") {
+    const scheduleIntent = intent === "slot_cancelled" ? "viewing_schedule" : intent;
+    return {
+      body: letter(input.contactName, scheduleParagraph(scheduleIntent, input.slots)),
+      otherBody: letter(input.contactName, otherTimeParagraph(scheduleIntent, input.slots)),
+      altBody: letter(input.contactName, DECLINE_APPOINTMENT),
+    };
   }
   if (intent === "documents") {
-    return { body: letter(input.contactName, documentParagraph(input.body)), altBody: "" };
+    return { body: documentsDraft(input.contactName, input.documentLabels ?? [], input.body), altBody: "", otherBody: "" };
   }
   if (intent === "waitlist") {
     return {
       body: letter(input.contactName, "Vielen Dank für die Rückmeldung. Ich bleibe gerne auf der Warteliste."),
       altBody: "",
+      otherBody: "",
     };
   }
   if (intent === "viewing_followup") {
     return {
       body: letter(input.contactName, "Vielen Dank für die Besichtigung. Ich bin weiterhin interessiert."),
       altBody: letter(input.contactName, "Vielen Dank für die Besichtigung. Ich ziehe meine Bewerbung zurück."),
+      otherBody: "",
     };
   }
   if (intent === "contract_outcome") {
     return {
       body: letter(input.contactName, "Vielen Dank. Ich nehme das Angebot an."),
       altBody: letter(input.contactName, "Vielen Dank für die Rückmeldung. Ich möchte den Vertrag nicht abschließen."),
+      otherBody: "",
     };
   }
   return null;
@@ -446,7 +503,12 @@ function intentForTopic(topic: MailTopic): MailIntent {
 }
 
 function isCloseIntent(intent: MailIntent): boolean {
-  return intent === "viewing_confirm" || intent === "contract_confirm" || intent === "contract_outcome";
+  return (
+    intent === "viewing_confirm" ||
+    intent === "contract_confirm" ||
+    intent === "contract_outcome" ||
+    intent === "cancelled_by_us"
+  );
 }
 
 function milestone(text: string, body: string): { intent: MailIntent; evidence: string } | null {
@@ -496,7 +558,12 @@ function quiet(text: string): boolean {
   return !findPhrase(text, ASK_PHRASES);
 }
 
-function confirmDraft(contactName: string | null, intent: MailIntent, visit: CitedSlot | null): DraftText | null {
+function confirmDraft(
+  contactName: string | null,
+  intent: MailIntent,
+  visit: CitedSlot | null,
+  slots: readonly Date[],
+): DraftText | null {
   const when = visit?.when.trim() ?? "";
   const place = visit?.place.trim() ?? "";
   if (!when && !place) {
@@ -504,7 +571,21 @@ function confirmDraft(contactName: string | null, intent: MailIntent, visit: Cit
   }
   const parts = [when ? `am ${when}` : "", place ? `in ${place}` : ""].filter(Boolean);
   const noun = intent === "contract_confirm" ? "Termin zur Vertragsunterzeichnung" : "Besichtigungstermin";
-  return { body: letter(contactName, `Ich bestätige den ${noun} ${parts.join(" ")}.`), altBody: "" };
+  return {
+    body: letter(contactName, `Ich bestätige den ${noun} ${parts.join(" ")}.`),
+    otherBody: letter(contactName, otherTimeParagraph(intent, slots)),
+    altBody: letter(contactName, DECLINE_APPOINTMENT),
+  };
+}
+
+function otherTimeParagraph(intent: MailIntent, slots: readonly Date[]): string {
+  const signing = intent === "contract_schedule" || intent === "contract_confirm";
+  const noun = signing ? "zur Vertragsunterzeichnung" : "zur Besichtigung";
+  if (slots.length === 0) {
+    return `Der vorgeschlagene Termin passt mir leider nicht. Bitte nennen Sie mir ein paar andere Zeiten ${noun}.`;
+  }
+  const lines = slots.map((slot) => `- ${formatEvening(slot)}`);
+  return `Der vorgeschlagene Termin passt mir leider nicht.\nMir passen folgende Zeiten:\n${lines.join("\n")}\nBitte sagen Sie mir, welcher Termin passt.`;
 }
 
 function scheduleParagraph(intent: MailIntent, slots: readonly Date[]): string {
@@ -516,12 +597,24 @@ function scheduleParagraph(intent: MailIntent, slots: readonly Date[]): string {
   return `Gerne komme ich ${noun}.\nMir passen folgende Zeiten:\n${lines.join("\n")}\nBitte sagen Sie mir, welcher Termin passt.`;
 }
 
-function documentParagraph(body: string): string {
+export function documentsDraft(contactName: string | null, labels: readonly string[], body: string): string {
+  return letter(contactName, documentParagraph(body, labels));
+}
+
+function documentParagraph(body: string, labels: readonly string[]): string {
+  const named = labels.length > 0 ? joinGerman(labels) : "SCHUFA, Gehaltsnachweise und Selbstauskunft";
   const link = uploadLink(body);
   if (link) {
-    return `Gerne lade ich die Unterlagen (SCHUFA, Gehaltsnachweise und Selbstauskunft) hier hoch: ${link}`;
+    return `Gerne lade ich die Unterlagen (${named}) hier hoch: ${link}`;
   }
-  return "Gerne sende ich Ihnen die Unterlagen (SCHUFA, Gehaltsnachweise und Selbstauskunft).";
+  return `Gerne sende ich Ihnen die Unterlagen (${named}).`;
+}
+
+function joinGerman(items: readonly string[]): string {
+  if (items.length <= 1) {
+    return items[0] ?? "";
+  }
+  return `${items.slice(0, -1).join(", ")} und ${items[items.length - 1]}`;
 }
 
 function uploadLink(body: string): string {

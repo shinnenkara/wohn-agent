@@ -10,8 +10,10 @@ import { createNotifier } from "../adapters/notify/create-notifier.js";
 import { loadNotifyCredentials, NOTIFY_CREDENTIALS_PATH } from "../adapters/notify/notify-credentials.js";
 import { SqliteAccountStore } from "../adapters/sqlite/account-store.js";
 import { openDatabase } from "../adapters/sqlite/database.js";
+import { SqliteListingRepository } from "../adapters/sqlite/listing-repository.js";
 import { SqliteMailStore } from "../adapters/sqlite/mail-store.js";
 import { SqliteProgressLog } from "../adapters/sqlite/progress-log.js";
+import { ensureStoredAccount } from "./login-main.js";
 import { syncInbox, type SyncResult } from "../application/sync-inbox.js";
 import { syncSince } from "../domain/google-window.js";
 import { createLogger } from "./logger.js";
@@ -22,13 +24,20 @@ export interface SyncApplication {
   shutdown(): void;
 }
 
-export function composeSync(config: GoogleConfig): SyncApplication {
+export async function composeSync(config: GoogleConfig): Promise<SyncApplication> {
   const credentials = loadGoogleCredentials(GOOGLE_CREDENTIALS_PATH);
   if (!credentials) {
     throw new Error("Google is not connected. Run npm run login.");
   }
   const db = openDatabase(config.databasePath);
   const accounts = new SqliteAccountStore(db);
+  await ensureStoredAccount({
+    accounts,
+    googleUrl: SHARED_GOOGLE_URL,
+    deviceToken: credentials.deviceToken,
+    fetchImpl: fetch,
+    now: systemClock.now(),
+  });
   const progress = new SqliteProgressLog(db);
   const backfilled = progress.backfillListings(systemClock.now());
   const authorizer = createAuthorizer({
@@ -55,6 +64,7 @@ export function composeSync(config: GoogleConfig): SyncApplication {
           mailbox: new GmailMailbox(authorizer, fetch),
           agenda: new CalendarAgenda(authorizer, fetch),
           mail: new SqliteMailStore(db),
+          listings: new SqliteListingRepository(db),
           progress,
           reader,
           resolver: reader,

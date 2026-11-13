@@ -10,6 +10,8 @@ export const INTENT_CODES = [
   "SELF_DISCLOSURE_REQ",
   "APPT_PROPOSAL",
   "APPT_CONFIRMATION",
+  "APPT_CANCELLED_BY_US",
+  "APPT_SLOT_CANCELLED",
   "POST_VIEWING_INTEREST",
   "CONTRACT_DRAFT_REVIEW",
   "CONTRACT_SIGNING_ARR",
@@ -55,9 +57,14 @@ export const RISK_LEVELS = ["SAFE", "WARN_DSGVO_VIOLATION", "CRITICAL_SCAM_BLOCK
 
 export type RiskLevel = (typeof RISK_LEVELS)[number];
 
+export const RELEVANCE_LABELS = ["unrelated", "possible"] as const;
+
+export type Relevance = (typeof RELEVANCE_LABELS)[number];
+
 export const INTENT_PRIORITY: Record<IntentCode, Priority> = {
   PORTAL_INVITE_LINK: "P0_CRITICAL",
   APPT_PROPOSAL: "P0_CRITICAL",
+  APPT_SLOT_CANCELLED: "P0_CRITICAL",
   CONTRACT_DRAFT_REVIEW: "P0_CRITICAL",
   CONTRACT_SIGNING_ARR: "P0_CRITICAL",
   APPT_CONFIRMATION: "P1_HIGH",
@@ -68,11 +75,14 @@ export const INTENT_PRIORITY: Record<IntentCode, Priority> = {
   IS24_AUTO_ACK: "P3_SILENT",
   LANDLORD_WAIT_ACK: "P3_SILENT",
   REJECTION: "P3_SILENT",
+  APPT_CANCELLED_BY_US: "P3_SILENT",
 };
 
 const DRAFT_INTENT: Record<IntentCode, MailIntent | null> = {
   PORTAL_INVITE_LINK: null,
   APPT_PROPOSAL: "viewing_schedule",
+  APPT_CANCELLED_BY_US: null,
+  APPT_SLOT_CANCELLED: "slot_cancelled",
   CONTRACT_DRAFT_REVIEW: "contract_outcome",
   CONTRACT_SIGNING_ARR: "contract_schedule",
   APPT_CONFIRMATION: "viewing_confirm",
@@ -90,6 +100,8 @@ const MAIL_INTENT_CODE: Partial<Record<MailIntent, IntentCode>> = {
   viewing_schedule: "APPT_PROPOSAL",
   viewing_confirm: "APPT_CONFIRMATION",
   viewing_followup: "POST_VIEWING_INTEREST",
+  cancelled_by_us: "APPT_CANCELLED_BY_US",
+  slot_cancelled: "APPT_SLOT_CANCELLED",
   contract_schedule: "CONTRACT_SIGNING_ARR",
   contract_confirm: "CONTRACT_SIGNING_ARR",
   contract_outcome: "CONTRACT_DRAFT_REVIEW",
@@ -173,6 +185,7 @@ export interface ProposedFlag {
 export interface ProposedTriage {
   intents: readonly ProposedIntent[];
   redFlags: readonly ProposedFlag[];
+  relevance?: string;
 }
 
 export interface IntentMetadata {
@@ -205,6 +218,7 @@ export interface TriageDecision {
   notify: boolean;
   blocked: boolean;
   draft: DraftChoice | null;
+  relevance: Relevance;
 }
 
 export function isIntentCode(value: string): value is IntentCode {
@@ -215,8 +229,23 @@ export function isDocumentCode(value: string): value is DocumentCode {
   return (DOCUMENT_CODES as readonly string[]).includes(value);
 }
 
+export function isPhaseADocument(code: DocumentCode): boolean {
+  return PHASE_A_DOCUMENTS.has(code);
+}
+
 export function isRedFlag(value: string): value is RedFlag {
   return (RED_FLAGS as readonly string[]).includes(value);
+}
+
+export function isRelevance(value: string): value is Relevance {
+  return (RELEVANCE_LABELS as readonly string[]).includes(value);
+}
+
+export function settleRelevance(raw: string, keptIntents: number): Relevance {
+  if (keptIntents > 0) {
+    return "possible";
+  }
+  return raw === "unrelated" ? "unrelated" : "possible";
 }
 
 export function draftIntentFor(code: IntentCode): MailIntent | null {
@@ -238,10 +267,16 @@ export function rulesSkipModel(subject: string, body: string, classification: Ma
   if (!classification) {
     return false;
   }
+  if (portalReceipt(subject, body)) {
+    return true;
+  }
   if (hasSecondSignal(subject, body)) {
     return false;
   }
   if (quotedRejection(subject, body)) {
+    return true;
+  }
+  if (classification.intent === "cancelled_by_us" || classification.intent === "slot_cancelled") {
     return true;
   }
   return classification.intent === "receipt" || classification.intent === "waitlist";
@@ -253,6 +288,12 @@ export function proposeFromRules(input: {
   body: string;
   classification: MailClassification;
 }): ProposedTriage {
+  if (input.classification.intent === "cancelled_by_us") {
+    return { intents: [bare("APPT_CANCELLED_BY_US", input.classification.evidence)], redFlags: [] };
+  }
+  if (input.classification.intent === "slot_cancelled") {
+    return { intents: [bare("APPT_SLOT_CANCELLED", input.classification.evidence)], redFlags: [] };
+  }
   const rejection = quotedRejection(input.subject, input.body);
   if (rejection) {
     return { intents: [bare("REJECTION", rejection)], redFlags: [] };
@@ -272,7 +313,7 @@ export function proposeFromRules(input: {
       const code = mapped === "DOC_PACKAGE_REQ" && documents.length === 0 && disclosure ? "SELF_DISCLOSURE_REQ" : mapped;
       intents.push({
         ...bare(code, input.classification.evidence),
-        requestedDocuments: code === "SELF_DISCLOSURE_REQ" ? [] : documents,
+        requestedDocuments: code === "DOC_PACKAGE_REQ" ? documents : [],
       });
       if (code === "DOC_PACKAGE_REQ" && disclosure) {
         intents.push(bare("SELF_DISCLOSURE_REQ", "selbstauskunft"));
@@ -343,6 +384,51 @@ export function confirmTriage(input: {
     notify: priority !== null && priority !== "P3_SILENT",
     blocked: riskLevel === "CRITICAL_SCAM_BLOCK",
     draft: hardBlock ? null : pickDraft(kept),
+    relevance: settleRelevance(input.proposed.relevance ?? "", kept.length),
+  };
+}
+
+export function decisionFromStored(input: {
+  intents: readonly {
+    code: string;
+    confidence: number;
+    summary: string;
+    metadataJson: string;
+    dskViolation: boolean;
+  }[];
+  riskLevel: string;
+  redFlags: readonly string[];
+  relevance: string;
+}): TriageDecision {
+  const intents: KeptIntent[] = [];
+  for (const row of input.intents) {
+    if (!isIntentCode(row.code)) {
+      continue;
+    }
+    intents.push({
+      code: row.code,
+      confidence: clampConfidence(row.confidence),
+      summary: row.summary,
+      metadata: metadataFromJson(row.metadataJson),
+      dskViolation: row.dskViolation,
+    });
+  }
+  intents.sort((left, right) => priorityRank(INTENT_PRIORITY[left.code]) - priorityRank(INTENT_PRIORITY[right.code]));
+  const redFlags = input.redFlags.filter(isRedFlag);
+  const riskLevel: RiskLevel = (RISK_LEVELS as readonly string[]).includes(input.riskLevel)
+    ? (input.riskLevel as RiskLevel)
+    : "SAFE";
+  const blocked = riskLevel === "CRITICAL_SCAM_BLOCK";
+  const priority = intents[0] ? INTENT_PRIORITY[intents[0].code] : null;
+  return {
+    intents,
+    riskLevel,
+    redFlags,
+    priority,
+    notify: priority !== null && priority !== "P3_SILENT",
+    blocked,
+    draft: blocked ? null : pickDraft(intents),
+    relevance: settleRelevance(input.relevance, intents.length),
   };
 }
 
@@ -437,6 +523,56 @@ function clampConfidence(value: number): number {
   return Math.min(1, Math.max(0, scaled));
 }
 
+function metadataFromJson(payload: string): IntentMetadata {
+  const empty: IntentMetadata = {
+    citation: "",
+    actionDeepLink: null,
+    linkCitation: null,
+    requestedDocuments: [],
+    proposedSlots: [],
+  };
+  try {
+    const parsed = JSON.parse(payload) as {
+      citation?: unknown;
+      actionDeepLink?: unknown;
+      linkCitation?: unknown;
+      requestedDocuments?: unknown;
+      proposedSlots?: unknown;
+    };
+    const documents = Array.isArray(parsed.requestedDocuments)
+      ? parsed.requestedDocuments.filter(isDocumentCode)
+      : [];
+    const slots = Array.isArray(parsed.proposedSlots)
+      ? parsed.proposedSlots.flatMap((item) => {
+          if (!item || typeof item !== "object") {
+            return [];
+          }
+          const slot = item as { text?: unknown; citation?: unknown };
+          if (typeof slot.text !== "string" || typeof slot.citation !== "string" || slot.text.trim() === "") {
+            return [];
+          }
+          return [{ text: slot.text, citation: slot.citation }];
+        })
+      : [];
+    return {
+      citation: typeof parsed.citation === "string" ? parsed.citation : "",
+      actionDeepLink: typeof parsed.actionDeepLink === "string" ? parsed.actionDeepLink : null,
+      linkCitation: typeof parsed.linkCitation === "string" ? parsed.linkCitation : null,
+      requestedDocuments: documents,
+      proposedSlots: slots,
+    };
+  } catch {
+    return empty;
+  }
+}
+
+function portalReceipt(subject: string, body: string): boolean {
+  const text = `${subject}\n${body}`.toLowerCase().replace(/\s+/g, " ");
+  return ["persönliche vorstellung beim anbieter", "kontaktaufnahme wurde erfolgreich verschickt", "anfrage versendet"].some(
+    (phrase) => text.includes(phrase),
+  );
+}
+
 function refusesViewing(text: string): boolean {
   const lower = text.toLowerCase();
   return REFUSED_VIEWING.some((phrase) => lower.includes(phrase));
@@ -462,6 +598,34 @@ function documentsIn(text: string): DocumentCode[] {
     found.push("WBS");
   }
   return found;
+}
+
+export function judgmentCitation(decisionJson: string): string {
+  try {
+    const parsed = JSON.parse(decisionJson) as {
+      intents?: Array<{ code?: unknown; citation?: unknown; requestedDocuments?: unknown }>;
+    };
+    const intents = Array.isArray(parsed.intents) ? parsed.intents : [];
+    const scam = intents.find(
+      (intent) => intent.code === "SCAM_SUSPECTED" && typeof intent.citation === "string" && intent.citation.trim() !== "",
+    );
+    if (scam && typeof scam.citation === "string") {
+      return scam.citation.trim();
+    }
+    const documents = intents.find(
+      (intent) =>
+        Array.isArray(intent.requestedDocuments) &&
+        intent.requestedDocuments.length > 0 &&
+        typeof intent.citation === "string" &&
+        intent.citation.trim() !== "",
+    );
+    if (documents && typeof documents.citation === "string") {
+      return documents.citation.trim();
+    }
+    return "";
+  } catch {
+    return "";
+  }
 }
 
 function bare(code: IntentCode, citation: string): ProposedIntent {

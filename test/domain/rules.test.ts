@@ -278,7 +278,8 @@ describe("captcha breaker and hours", () => {
     assert.equal(isWithinActiveHours(new Date("2026-11-04T06:00:00.000Z")), true);
     assert.equal(isWithinActiveHours(new Date("2026-11-04T22:00:00.000Z")), false);
     assert.equal(pollIntervalMs({ next: () => 0 }), 48_000);
-    assert.equal(betweenListingDelayMs({ next: () => 0 }), 8_000);
+    assert.equal(betweenListingDelayMs({ next: () => 0 }), 60_000);
+    assert.equal(betweenListingDelayMs({ next: () => 1 }), 120_000);
     assert.equal(captchaCooldownMs({ next: () => 0 }), 90_000);
   });
 });

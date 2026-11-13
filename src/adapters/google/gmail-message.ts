@@ -2,8 +2,9 @@ import type { FetchedMail } from "../../application/ports/mailbox.js";
 
 export interface GmailPart {
   mimeType?: string;
+  filename?: string;
   headers?: Array<{ name?: string; value?: string }>;
-  body?: { data?: string };
+  body?: { data?: string; attachmentId?: string };
   parts?: GmailPart[];
 }
 
@@ -70,4 +71,41 @@ function header(part: GmailPart | undefined, name: string): string {
 
 function decodeBase64Url(value: string): string {
   return Buffer.from(value, "base64url").toString("utf8");
+}
+
+export interface PdfPart {
+  filename: string;
+  mimeType: string;
+  attachmentId: string;
+  data: string | null;
+}
+
+export function listPdfParts(message: GmailMessageJson): PdfPart[] {
+  const found: PdfPart[] = [];
+  collectPdfs(message.payload, found);
+  return found;
+}
+
+function collectPdfs(part: GmailPart | undefined, found: PdfPart[]): void {
+  if (!part) {
+    return;
+  }
+  const mime = (part.mimeType ?? "").toLowerCase();
+  const filename = part.filename?.trim() ?? "";
+  const pdf = mime === "application/pdf" || filename.toLowerCase().endsWith(".pdf");
+  if (pdf) {
+    const inline = part.body?.data ?? null;
+    const attachmentId = part.body?.attachmentId?.trim() || (inline ? `inline:${found.length}` : "");
+    if (attachmentId) {
+      found.push({
+        filename: filename || "vertrag.pdf",
+        mimeType: mime || "application/pdf",
+        attachmentId,
+        data: inline,
+      });
+    }
+  }
+  for (const child of part.parts ?? []) {
+    collectPdfs(child, found);
+  }
 }

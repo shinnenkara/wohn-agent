@@ -2,13 +2,15 @@ import type { AccountStore } from "./ports/account-store.js";
 import type { Agenda, AgendaEvent } from "./ports/agenda.js";
 import type { Clock } from "./ports/clock.js";
 import type { Mailbox, FetchedMail } from "./ports/mailbox.js";
-import type { MailStore, UnreadMail } from "./ports/mail-store.js";
+import type { MailStore, NewJudgment, UnreadMail } from "./ports/mail-store.js";
+import type { ListingRepository } from "./ports/listing-repository.js";
 import { MailReaderRateLimit, type MailReader } from "./ports/mail-reader.js";
 import type { MailResolver } from "./ports/mail-resolver.js";
 import type { Notifier } from "./ports/notifier.js";
 import type { ProgressLog } from "./ports/progress-log.js";
 import { assignMail, stageForMail } from "./assign-mail.js";
 import { materializeActions } from "./materialize-actions.js";
+import { rememberSentApplication } from "./remember-sent.js";
 import { scoutIdForEvent } from "../domain/event-link.js";
 import { gmailUrl } from "../domain/gmail-url.js";
 import { emptyProposal, validateCitation, type MailProposal } from "../domain/mail-citation.js";
@@ -31,9 +33,11 @@ import {
   type CitedSlot,
   type MailClassification,
 } from "../domain/mail-reply.js";
-import type { FunnelStage } from "../domain/progress.js";
+import { mailOutcome, type FunnelStage } from "../domain/progress.js";
+import { rankForReading, sameAccount } from "../domain/reading-order.js";
 import { calendarNotice, parseScoutMail } from "../domain/scout-mail.js";
 import { stripQuotedReply } from "../domain/strip-reply.js";
+import { DOCUMENT_LABELS, orderedDocuments } from "../domain/document-bundle.js";
 import {
   confirmTriage,
   proposeFromRules,
@@ -51,6 +55,7 @@ export interface SyncDependencies {
   mailbox: Mailbox;
   agenda: Agenda;
   mail: MailStore;
+  listings: ListingRepository;
   progress: ProgressLog;
   reader: MailReader | null;
   resolver: MailResolver | null;
@@ -106,6 +111,12 @@ async function syncMail(
 ): Promise<void> {
   let fetched: FetchedMail[] = [];
   let nextHistory = "";
+  const candidates = deps.progress.openApplications(options.since);
+  const take = async (mails: readonly FetchedMail[]) => {
+    for (const item of mails) {
+      ingestMail(deps, item, candidates, result);
+    }
+  };
   if (!options.updateCursors) {
     if (options.mailCap === 0) {
       return;
@@ -113,7 +124,7 @@ async function syncMail(
     fetched = limited(await deps.mailbox.listSince(options.since, options.till), options.mailCap);
   } else if (!historyId) {
     nextHistory = await deps.mailbox.historyId();
-    fetched = await deps.mailbox.listSince(options.since, null);
+    await deps.mailbox.listSince(options.since, null, { skip: deps.mail.storedGmailIds(), onBatch: take });
   } else {
     const added = await deps.mailbox.addedSince(historyId);
     if (added.expired) {
@@ -126,13 +137,12 @@ async function syncMail(
         }
       }
       nextHistory = await deps.mailbox.historyId();
-      fetched = await deps.mailbox.listSince(fallback, null);
+      await deps.mailbox.listSince(fallback, null, { skip: deps.mail.storedGmailIds(), onBatch: take });
     } else {
       fetched = added.mails;
       nextHistory = added.latestId;
     }
   }
-  const candidates = deps.progress.openApplications(options.since);
   for (const item of fetched) {
     ingestMail(deps, item, candidates, result);
   }
@@ -177,6 +187,7 @@ function ingestMail(
     return;
   }
   result.mail += 1;
+  rememberSentApplication(deps.listings, parsed, item.subject, clean, deps.clock.now());
   deps.mail.saveThread({
     threadId: item.threadId,
     subject: item.subject,
@@ -288,6 +299,10 @@ async function syncEvents(
 }
 
 function ingestEvent(deps: SyncDependencies, event: AgendaEvent, result: SyncResult): void {
+  if (event.cancelled) {
+    deps.mail.removeEvent(event.id);
+    return;
+  }
   const scoutId = scoutIdForEvent(event, deps.mail.visits()) ?? "";
   const inserted = deps.mail.insertEvent(
     {
@@ -314,8 +329,10 @@ async function readPending(deps: SyncDependencies, since: Date, result: SyncResu
   const pending = deps.mail.pendingWithoutReading();
   result.waiting = pending.length;
   const candidates = deps.progress.openApplications(since);
+  const accountEmail = deps.accounts.load()?.email ?? null;
+  const ordered = rankForReading(pending, { accountEmail, candidates });
   let reads = 0;
-  for (const item of pending) {
+  for (const item of ordered) {
     let current = item;
     if (!current.scoutId && deps.resolver && candidates.length > 0 && reads < MAIL_READINGS_PER_RUN) {
       if (reads > 0) {
@@ -327,23 +344,45 @@ async function readPending(deps: SyncDependencies, since: Date, result: SyncResu
           body: current.cleanText,
           candidates,
         });
+        const accepted = picked && candidates.some((candidate) => candidate.scoutId === picked) ? picked : "";
+        recordJudgment(deps, {
+          scoutId: accepted,
+          mailId: current.gmailId,
+          source: "mail_resolve",
+          branch: "model",
+          stage: null,
+          proposal: { scoutId: picked ?? "" },
+          decision: { scoutId: accepted },
+          error: "",
+        });
         reads += 1;
-        if (picked && candidates.some((candidate) => candidate.scoutId === picked)) {
+        if (accepted) {
           result.advanced += assignMail(deps, {
             gmailId: current.gmailId,
             threadId: current.threadId,
             from: current.from,
             subject: current.subject,
             kind: current.kind,
-            scoutId: picked,
+            scoutId: accepted,
             method: "model",
           });
-          current = { ...current, scoutId: picked };
+          current = { ...current, scoutId: accepted };
         }
       } catch (error) {
         if (error instanceof MailReaderRateLimit) {
           break;
         }
+        const message = error instanceof Error ? error.message : String(error);
+        recordJudgment(deps, {
+          scoutId: "",
+          mailId: current.gmailId,
+          source: "mail_resolve",
+          branch: "model",
+          stage: null,
+          proposal: null,
+          decision: null,
+          error: message,
+        });
         reads += 1;
       }
     }
@@ -352,6 +391,17 @@ async function readPending(deps: SyncDependencies, since: Date, result: SyncResu
     const stage = current.scoutId ? deps.progress.stageOf(current.scoutId) : null;
     const ruled = classifyReply(current.subject, body, open);
     if (ruled && rulesSkipModel(current.subject, body, ruled)) {
+      const ruledDecision = decisionFromRules(current, body, stage, ruled);
+      recordJudgment(deps, {
+        scoutId: current.scoutId,
+        mailId: current.gmailId,
+        source: "rules",
+        branch: "rules",
+        stage,
+        proposal: ruledDecision.proposed,
+        decision: ruledDecision.decision,
+        error: "",
+      });
       await remember(
         deps,
         result,
@@ -360,7 +410,7 @@ async function readPending(deps: SyncDependencies, since: Date, result: SyncResu
         ruled,
         emptyProposal(),
         ruled.intent === "viewing_confirm" ? citedVisit(body) : null,
-        decisionFor(current, body, stage, ruled),
+        ruledDecision.decision,
       );
       continue;
     }
@@ -369,11 +419,26 @@ async function readPending(deps: SyncDependencies, since: Date, result: SyncResu
         await deps.clock.sleep(MAIL_READING_GAP_MS);
       }
       try {
-        const raw = await deps.reader.triage({ subject: current.subject, body, stage });
+        const raw = await deps.reader.triage({
+          subject: current.subject,
+          body,
+          stage,
+          outbound: sameAccount(current.from, accountEmail),
+        });
         const decision = confirmTriage({ text: corpus(current.subject, body), stage, proposed: raw });
         const classification = decision.draft
           ? settleReply(open, decision.draft.intent, decision.draft.citation, current.subject, body)
           : (ruled ?? { intent: "unknown" as const, relation: null, topic: null, evidence: "" });
+        recordJudgment(deps, {
+          scoutId: current.scoutId,
+          mailId: current.gmailId,
+          source: "mail_triage",
+          branch: "model",
+          stage,
+          proposal: raw,
+          decision,
+          error: "",
+        });
         await remember(
           deps,
           result,
@@ -389,12 +454,33 @@ async function readPending(deps: SyncDependencies, since: Date, result: SyncResu
           break;
         }
         const message = error instanceof Error ? error.message : String(error);
+        recordJudgment(deps, {
+          scoutId: current.scoutId,
+          mailId: current.gmailId,
+          source: "mail_triage",
+          branch: "model",
+          stage,
+          proposal: null,
+          decision: null,
+          error: message,
+        });
         deps.mail.insertReading(failedReading(deps, current.gmailId, JSON.stringify({ error: message })));
       }
       reads += 1;
       continue;
     }
     if (ruled) {
+      const ruledDecision = decisionFromRules(current, body, stage, ruled);
+      recordJudgment(deps, {
+        scoutId: current.scoutId,
+        mailId: current.gmailId,
+        source: "rules",
+        branch: "rules_fallback",
+        stage,
+        proposal: ruledDecision.proposed,
+        decision: ruledDecision.decision,
+        error: "",
+      });
       await remember(
         deps,
         result,
@@ -403,7 +489,7 @@ async function readPending(deps: SyncDependencies, since: Date, result: SyncResu
         ruled,
         emptyProposal(),
         ruled.intent === "viewing_confirm" ? citedVisit(body) : null,
-        decisionFor(current, body, stage, ruled),
+        ruledDecision.decision,
       );
       continue;
     }
@@ -418,6 +504,17 @@ async function readPending(deps: SyncDependencies, since: Date, result: SyncResu
       const checked = validateCitation(body, raw.proposal);
       const classification = settleReply(open, raw.intent, raw.evidence, current.subject, body);
       const visit = checked.proposal.visit ?? (classification.intent === "viewing_confirm" ? citedVisit(body) : null);
+      const decision = decisionFor(current, body, stage, classification);
+      recordJudgment(deps, {
+        scoutId: current.scoutId,
+        mailId: current.gmailId,
+        source: "mail_propose",
+        branch: "model",
+        stage,
+        proposal: raw,
+        decision,
+        error: "",
+      });
       await remember(
         deps,
         result,
@@ -426,13 +523,23 @@ async function readPending(deps: SyncDependencies, since: Date, result: SyncResu
         classification,
         checked.proposal,
         visit,
-        decisionFor(current, body, stage, classification),
+        decision,
       );
     } catch (error) {
       if (error instanceof MailReaderRateLimit) {
         break;
       }
       const message = error instanceof Error ? error.message : String(error);
+      recordJudgment(deps, {
+        scoutId: current.scoutId,
+        mailId: current.gmailId,
+        source: "mail_propose",
+        branch: "model",
+        stage,
+        proposal: null,
+        decision: null,
+        error: message,
+      });
       deps.mail.insertReading(failedReading(deps, current.gmailId, JSON.stringify({ error: message })));
     }
     reads += 1;
@@ -451,11 +558,12 @@ async function remember(
   decision: TriageDecision | null,
 ): Promise<void> {
   const blocked = decision?.blocked === true;
+  const outbound = sameAccount(item.from, deps.accounts.load()?.email ?? null);
   const storedVisit = !blocked && visit
     ? { when: visit.when, place: visit.place, citation: visit.citation }
     : null;
   const contactName = proposal.contact?.name || senderName(item.from);
-  const draft = blocked
+  const draft = blocked || outbound
     ? null
     : renderDraft({
         classification,
@@ -464,6 +572,7 @@ async function remember(
         contactName,
         slots: eveningSlots(deps.clock.now(), deps.mail.busyIntervals()),
         visit: storedVisit,
+        documentLabels: requestedLabels(decision),
       });
   if (decision) {
     deps.mail.saveTriage(
@@ -475,10 +584,10 @@ async function remember(
         metadataJson: JSON.stringify(intent.metadata),
         dskViolation: intent.dskViolation,
       })),
-      { level: decision.riskLevel, redFlagsJson: JSON.stringify(decision.redFlags) },
+      { level: decision.riskLevel, redFlagsJson: JSON.stringify(decision.redFlags), relevance: decision.relevance },
     );
   }
-  if (!blocked) {
+  if (!blocked && !outbound) {
     deps.mail.insertDraft({
       mailId: item.gmailId,
       intent: classification.intent,
@@ -486,6 +595,7 @@ async function remember(
       topic: classification.topic ?? "",
       body: draft?.body ?? "",
       altBody: draft?.altBody ?? "",
+      otherBody: draft?.otherBody ?? "",
       createdAt: deps.clock.now(),
     });
   }
@@ -498,7 +608,7 @@ async function remember(
       evidence: classification.evidence,
     }),
   );
-  if (decision) {
+  if (decision && !(outbound && item.scoutId === "")) {
     materializeActions(deps.mail, {
       scoutId: item.scoutId,
       mailId: item.gmailId,
@@ -516,6 +626,9 @@ async function remember(
     }
     if (storedVisit && item.scoutId) {
       advance(deps, result, item.scoutId, "viewing_offered", "mail", item.gmailId);
+    }
+    if (item.scoutId) {
+      applyOutcome(deps, item.scoutId, classification, decision);
     }
   }
   result.proposals += 1;
@@ -535,6 +648,35 @@ async function remember(
   }
 }
 
+function applyOutcome(
+  deps: SyncDependencies,
+  scoutId: string,
+  classification: MailClassification,
+  decision: TriageDecision | null,
+): void {
+  const next = mailOutcome({
+    intent: classification.intent,
+    codes: decision?.intents.map((intent) => intent.code) ?? [],
+  });
+  if (next === "reopen") {
+    deps.progress.reopenCancellation(scoutId, deps.clock.now());
+    return;
+  }
+  if (next) {
+    deps.progress.setOutcome(scoutId, next, deps.clock.now());
+  }
+}
+
+function requestedLabels(decision: TriageDecision | null): string[] | undefined {
+  if (!decision) {
+    return undefined;
+  }
+  const labels = orderedDocuments(decision.intents.flatMap((intent) => intent.metadata.requestedDocuments)).map(
+    (code) => DOCUMENT_LABELS[code],
+  );
+  return labels.length > 0 ? labels : undefined;
+}
+
 function allowsDraftAlert(decision: TriageDecision | null): boolean {
   if (!decision) {
     return true;
@@ -551,16 +693,71 @@ function decisionFor(
   stage: FunnelStage | null,
   classification: MailClassification,
 ): TriageDecision {
-  return confirmTriage({
-    text: corpus(item.subject, body),
-    stage,
-    proposed: proposeFromRules({
-      from: item.from,
-      subject: item.subject,
-      body,
-      classification,
-    }),
+  return decisionFromRules(item, body, stage, classification).decision;
+}
+
+function decisionFromRules(
+  item: { from: string; subject: string },
+  body: string,
+  stage: FunnelStage | null,
+  classification: MailClassification,
+): { proposed: ReturnType<typeof proposeFromRules>; decision: TriageDecision } {
+  const proposed = proposeFromRules({
+    from: item.from,
+    subject: item.subject,
+    body,
+    classification,
   });
+  return {
+    proposed,
+    decision: confirmTriage({ text: corpus(item.subject, body), stage, proposed }),
+  };
+}
+
+function recordJudgment(
+  deps: SyncDependencies,
+  input: {
+    scoutId: string;
+    mailId: string;
+    source: NewJudgment["source"];
+    branch: NewJudgment["branch"];
+    stage: FunnelStage | null;
+    proposal: unknown;
+    decision: TriageDecision | { scoutId: string } | null;
+    error: string;
+  },
+): void {
+  deps.mail.insertJudgment({
+    scoutId: input.scoutId,
+    mailId: input.mailId,
+    source: input.source,
+    branch: input.branch,
+    model: input.branch === "model" ? deps.model : "",
+    stage: input.stage ?? "",
+    proposalJson: input.proposal == null ? "" : JSON.stringify(input.proposal),
+    decisionJson: decisionJson(input.decision),
+    error: input.error,
+    createdAt: deps.clock.now(),
+  });
+}
+
+function decisionJson(decision: TriageDecision | { scoutId: string } | null): string {
+  if (!decision) {
+    return "";
+  }
+  if ("intents" in decision) {
+    return JSON.stringify({
+      intents: decision.intents.map((intent) => ({
+        code: intent.code,
+        citation: intent.metadata.citation,
+        requestedDocuments: intent.metadata.requestedDocuments,
+      })),
+      riskLevel: decision.riskLevel,
+      redFlags: decision.redFlags,
+      relevance: decision.relevance,
+    });
+  }
+  return JSON.stringify(decision);
 }
 
 function visitFor(decision: TriageDecision, intent: string, body: string): CitedSlot | null {

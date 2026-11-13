@@ -4,11 +4,32 @@ import { SqliteMailStore } from "../adapters/sqlite/mail-store.js";
 import { SqliteProgressLog } from "../adapters/sqlite/progress-log.js";
 import { openDatabase } from "../adapters/sqlite/database.js";
 import { assignMail } from "../application/assign-mail.js";
+import { applyStoredTriage } from "../application/materialize-actions.js";
 
 export interface LinkResponse {
   status: number;
   type: string;
   body: string;
+}
+
+export function hideUnlinkedMail(databasePath: string, gmailId: string, hidden: boolean): LinkResponse {
+  if (!/^[\w-]{1,128}$/.test(gmailId)) {
+    return text(400, "Unknown mail");
+  }
+  const db = openDatabase(databasePath);
+  try {
+    const mail = new SqliteMailStore(db);
+    if (!mail.setOperatorList(gmailId, hidden)) {
+      return text(404, "Unknown mail");
+    }
+    return {
+      status: 200,
+      type: "application/json; charset=utf-8",
+      body: JSON.stringify({ hidden }),
+    };
+  } finally {
+    db.close();
+  }
 }
 
 export function linkUnlinkedMail(databasePath: string, gmailId: string, scoutId: string, at: Date): LinkResponse {
@@ -49,6 +70,7 @@ function linkIn(db: DatabaseSync, gmailId: string, scoutId: string, at: Date): L
       method: "manual",
     },
   );
+  applyStoredTriage(mail, { gmailId, scoutId, at });
   return {
     status: 200,
     type: "application/json; charset=utf-8",

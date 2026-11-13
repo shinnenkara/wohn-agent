@@ -12,6 +12,7 @@ import {
   DOCUMENT_CODES,
   INTENT_CODES,
   RED_FLAGS,
+  RELEVANCE_LABELS,
   type ProposedTriage,
 } from "../../domain/triage.js";
 
@@ -42,6 +43,7 @@ const ResolveSchema = z.object({
 });
 
 const TriageSchema = z.object({
+  relevance: z.string().optional(),
   intents: z
     .array(
       z.object({
@@ -292,21 +294,28 @@ function schema(): Record<string, unknown> {
 }
 
 const TRIAGE_SYSTEM =
-  "You triage one landlord or portal email about a Berlin apartment application. " +
+  "You triage one email about a Berlin apartment application. " +
   "Return every distinct intent you can cite. " +
   `intentCode is one of: ${INTENT_CODES.join(", ")}. ` +
   `requestedDocuments is a subset of: ${DOCUMENT_CODES.join(", ")}. ` +
   `redFlags.code is one of: ${RED_FLAGS.join(", ")}. ` +
+  `relevance is one of: ${RELEVANCE_LABELS.join(", ")}. ` +
+  "Use unrelated when the email is not about an apartment application, and possible when it might be. " +
   "citation, linkCitation, and each proposedSlots.citation must be exact substrings of the email. " +
   "Leave actionDeepLink empty when the email has no http link. " +
-  "Do not assign a priority or a risk level.";
+  "Do not assign a priority or a risk level. " +
+  "Do not choose an apartment.";
 
 function triagePrompt(input: MailTriageInput): string {
-  return `Stage: ${input.stage ?? "unknown"}\n\nSubject: ${input.subject}\n\n${input.body}`;
+  const lead = input.outbound
+    ? "This message was sent by the apartment applicant. Classify what the applicant did.\n\n"
+    : "";
+  return `${lead}Stage: ${input.stage ?? "unknown"}\n\nSubject: ${input.subject}\n\n${input.body}`;
 }
 
 function toProposed(parsed: z.infer<typeof TriageSchema>): ProposedTriage {
   return {
+    relevance: parsed.relevance === "unrelated" || parsed.relevance === "possible" ? parsed.relevance : "",
     intents: (parsed.intents ?? []).map((intent) => ({
       code: intent.intentCode ?? "",
       confidence: intent.confidence ?? 0,
@@ -331,6 +340,7 @@ function triageSchema(): Record<string, unknown> {
   return {
     type: "object",
     properties: {
+      relevance: { type: "string", enum: [...RELEVANCE_LABELS] },
       intents: {
         type: "array",
         items: {

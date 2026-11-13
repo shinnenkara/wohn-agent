@@ -413,6 +413,10 @@ describe("agent loop", () => {
     await runTick(harness.loop, idleState(), new AbortController().signal);
     assert.equal(harness.listings.listByStatus("APPLIED").length, 2);
     assert.equal(harness.listings.listByStatus("DISCOVERED").length, 1);
+    assert.equal(
+      harness.logger.messages.filter((message) => message === "waiting 60s before the next listing").length,
+      2,
+    );
   });
 
   it("previews each listing once and leaves it unsent", async () => {

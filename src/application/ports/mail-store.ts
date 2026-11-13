@@ -79,6 +79,7 @@ export interface StoredDraft {
   topic: string;
   body: string;
   altBody: string;
+  otherBody: string;
   createdAt: Date;
 }
 
@@ -94,6 +95,12 @@ export interface StoredVisit {
   citation: string;
 }
 
+export interface UnlinkedJudgment {
+  code: string;
+  confidence: number;
+  summary: string;
+}
+
 export interface UnlinkedMail {
   id: string;
   url: string;
@@ -101,6 +108,10 @@ export interface UnlinkedMail {
   subject: string;
   sentAt: string;
   cleanText: string;
+  relevance: string;
+  read: boolean;
+  concealed: boolean;
+  judgments: UnlinkedJudgment[];
 }
 
 export interface UnlinkedEvent {
@@ -118,6 +129,41 @@ export interface MailReading {
   createdAt: Date;
 }
 
+export const JUDGMENT_SOURCES = ["mail_triage", "mail_propose", "mail_resolve", "rules"] as const;
+
+export type JudgmentSource = (typeof JUDGMENT_SOURCES)[number];
+
+export const JUDGMENT_BRANCHES = ["rules", "model", "rules_fallback"] as const;
+
+export type JudgmentBranch = (typeof JUDGMENT_BRANCHES)[number];
+
+export interface NewJudgment {
+  scoutId: string;
+  mailId: string;
+  source: JudgmentSource;
+  branch: JudgmentBranch;
+  model: string;
+  stage: string;
+  proposalJson: string;
+  decisionJson: string;
+  error: string;
+  createdAt: Date;
+}
+
+export interface StoredJudgment {
+  id: number;
+  createdAt: string;
+  scoutId: string;
+  mailId: string;
+  source: string;
+  branch: string;
+  model: string;
+  stage: string;
+  proposalJson: string;
+  decisionJson: string;
+  error: string;
+}
+
 export interface StoredTriageIntent {
   code: string;
   confidence: number;
@@ -129,12 +175,22 @@ export interface StoredTriageIntent {
 export interface StoredTriageRisk {
   level: string;
   redFlagsJson: string;
+  relevance: string;
 }
 
 export interface LoadedTriage {
   codes: string[];
   riskLevel: string;
   flags: string[];
+  relevance: string;
+}
+
+export interface StoredAppliedTriage {
+  intents: StoredTriageIntent[];
+  riskLevel: string;
+  redFlags: string[];
+  relevance: string;
+  draftBody: string;
 }
 
 export interface NewMailAction {
@@ -170,6 +226,17 @@ export interface OpenMailAction extends StoredAction {
   address: string;
   body: string;
   slotText: string;
+  requestedDocuments: string[];
+  dskViolation: boolean;
+  otherBody: string;
+  declineBody: string;
+  judgmentBranch: string;
+  judgmentCitation: string;
+}
+
+export interface DocumentSubmission {
+  mailId: string;
+  completedAt: string;
 }
 
 export interface ReplySource {
@@ -186,6 +253,7 @@ export interface ReplySource {
 export interface MailStore {
   insertMail(mail: StoredMail, createdAt: Date): boolean;
   latestSentAt(): string | null;
+  storedGmailIds(): ReadonlySet<string>;
   scoutIdForThread(threadId: string): string | null;
   scoutIdForMessageIds(ids: readonly string[]): string | null;
   unresolvedMail(): UnresolvedMail[];
@@ -203,16 +271,22 @@ export interface MailStore {
   pendingWithoutTriage(): UnreadMail[];
   saveTriage(mailId: string, intents: readonly StoredTriageIntent[], risk: StoredTriageRisk): void;
   loadTriage(mailId: string): LoadedTriage | null;
+  loadStoredTriage(mailId: string): StoredAppliedTriage | null;
+  attachActions(mailId: string, scoutId: string): void;
   insertReading(reading: MailReading): void;
+  insertJudgment(judgment: NewJudgment): void;
+  judgmentsForMail(mailId: string): StoredJudgment[];
   insertDraft(draft: StoredDraft): void;
   openTopic(scoutId: string): OpenTopic | null;
   saveOpenTopic(scoutId: string, topic: OpenTopic, at: Date): void;
   busyIntervals(): BusyInterval[];
   insertEvent(event: StoredEvent, createdAt: Date): boolean;
+  removeEvent(eventId: string): boolean;
   unlinkedEvents(): StoredEvent[];
   linkEvent(eventId: string, scoutId: string): void;
   visits(): StoredVisit[];
-  listUnlinkedMail(limit: number): UnlinkedMail[];
+  listUnlinkedMail(limit: number, includeHidden?: boolean): UnlinkedMail[];
+  setOperatorList(gmailId: string, hidden: boolean): boolean;
   listUnlinkedEvents(limit: number): UnlinkedEvent[];
   sentAt(gmailId: string): string | null;
   isQuarantined(scoutId: string): boolean;
@@ -225,6 +299,15 @@ export interface MailStore {
   listActions(): StoredAction[];
   listOpenActions(): OpenMailAction[];
   replySource(mailId: string): ReplySource | null;
+  recordSubmission(scoutId: string, mailId: string, at: Date): void;
+  submissionOf(scoutId: string): DocumentSubmission | null;
+  rejectionMailId(scoutId: string): string | null;
+  hasErasure(scoutId: string): boolean;
+  listingAddress(scoutId: string): string;
+  apartmentText(scoutId: string, exceptMailId: string): string;
+  saveScorecard(mailId: string, text: string, at: Date): void;
+  loadScorecard(mailId: string): string | null;
+  promoteDueErasure(now: Date): void;
 }
 
 export function visitFromPayload(payload: string): CitedVisit | null {

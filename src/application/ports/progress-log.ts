@@ -1,5 +1,5 @@
 import type { MailCandidate } from "../../domain/mail-link.js";
-import type { FunnelStage, ProgressSource } from "../../domain/progress.js";
+import type { ApplicationOutcome, FunnelStage, ProgressSource } from "../../domain/progress.js";
 
 export interface ProgressNote {
   scoutId: string;
@@ -35,6 +35,8 @@ export interface ApartmentMail {
   altDraft: string;
   composeUrl: string;
   altComposeUrl: string;
+  otherDraft: string;
+  otherComposeUrl: string;
   cleanText: string;
   intents: string[];
   riskLevel: string;
@@ -44,6 +46,8 @@ export interface ApartmentMail {
   linkUrl: string;
   linkHost: string;
   linksAreText: boolean;
+  judgmentBranch: string;
+  judgmentCitation: string;
 }
 
 export interface ApartmentTopic {
@@ -62,6 +66,7 @@ export interface ApartmentViewing {
 export interface ApartmentCard {
   scoutId: string;
   stage: FunnelStage;
+  outcome: ApplicationOutcome;
   title: string | null;
   url: string;
   opened: boolean;
@@ -87,10 +92,16 @@ export interface ApartmentCard {
 
 export interface ProgressLog {
   stageOf(scoutId: string): FunnelStage | null;
+  outcomeOf(scoutId: string): ApplicationOutcome | null;
+  setOutcome(scoutId: string, outcome: ApplicationOutcome, at: Date): void;
+  reopenCancellation(scoutId: string, at: Date): void;
   note(input: ProgressNote): boolean;
   backfillListings(at: Date): number;
   listStages(): StageRow[];
   listTransitions(): ProgressTransitionRow[];
   listApartments(stage: FunnelStage): ApartmentCard[];
+  listAllApartments(): ApartmentCard[];
+  listClosed(): ApartmentCard[];
+  closedCount(): number;
   openApplications(since: Date): MailCandidate[];
 }
